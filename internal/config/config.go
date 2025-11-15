@@ -1,0 +1,79 @@
+package config
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+	"time"
+)
+
+type ProviderType string
+
+const (
+	ProviderSample ProviderType = "sample"
+	ProviderHTTP   ProviderType = "http" // will be implemented when leader provides endpoint
+)
+
+type Config struct {
+	Port string
+
+	MetricsProvider ProviderType
+
+	// Leader endpoint settings (used later)
+	MetricsBaseURL string
+	MetricsTimeout time.Duration
+
+	// Algorithm tuning
+	TimeWindowSeconds int
+	TopKPeers         int
+
+	// Target service id for now (later you can derive from pod labels/annotations)
+	TargetServiceID string
+}
+
+func Load() (Config, error) {
+	cfg := Config{
+		Port:              getEnv("PORT", "9000"),
+		MetricsProvider:   ProviderType(getEnv("METRICS_PROVIDER", string(ProviderSample))),
+		MetricsBaseURL:    getEnv("METRICS_BASE_URL", "http://localhost:9090"),
+		MetricsTimeout:    getDurationMs("METRICS_TIMEOUT_MS", 1200),
+		TimeWindowSeconds: getInt("TIME_WINDOW_SECONDS", 300),
+		TopKPeers:         getInt("TOPK_PEERS", 5),
+		TargetServiceID:   getEnv("TARGET_SERVICE_ID", "default:checkoutservice"),
+	}
+
+	if cfg.MetricsProvider != ProviderSample && cfg.MetricsProvider != ProviderHTTP {
+		return Config{}, fmt.Errorf("invalid METRICS_PROVIDER: %s", cfg.MetricsProvider)
+	}
+
+	return cfg, nil
+}
+
+func getEnv(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+func getInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
+func getDurationMs(key string, defMs int) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return time.Duration(defMs) * time.Millisecond
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return time.Duration(defMs) * time.Millisecond
+	}
+	return time.Duration(n) * time.Millisecond
+}
