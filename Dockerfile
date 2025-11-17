@@ -3,7 +3,7 @@ WORKDIR /src
 COPY go.mod go.sum ./
 COPY internal ./internal
 COPY cmd ./cmd
-RUN go build -o /out/extender ./cmd/app
+RUN go build -o /out/extender ./cmd/extender
 
 FROM alpine:3.20
 WORKDIR /app

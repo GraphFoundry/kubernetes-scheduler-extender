@@ -47,7 +47,4 @@ type MetricsProvider interface {
 	GetHealth(ctx context.Context) (GraphHealth, error)
 	GetPeers(ctx context.Context, serviceName string, direction string, limit int) (PeersResponse, error)
 	GetCentrality(ctx context.Context) (CentralityResponse, error)
-
-	// Optional: keep it for later. For now sample implementation can return fixed values.
-	GetNodePenalty(ctx context.Context, nodeName string) (float64, error)
 }

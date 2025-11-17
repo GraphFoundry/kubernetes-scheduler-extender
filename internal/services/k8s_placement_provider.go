@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"log"
 	"os"
 	"path/filepath"
 
@@ -14,6 +15,15 @@ import (
 type K8sPlacementProvider struct {
 	clientset *kubernetes.Clientset
 }
+
+// K8sPlacementProvider queries the Kubernetes API to find
+// which services are currently running on which nodes.
+//
+// It builds a mapping:
+//   nodeName -> set of service names
+//
+// This allows the scheduler extender to understand service
+// colocation when calculating node scores.
 
 func NewK8sPlacementProvider() (*K8sPlacementProvider, error) {
 	cfg, err := inClusterConfig()
@@ -47,22 +57,25 @@ func kubeConfig() (*rest.Config, error) {
 }
 
 func (p *K8sPlacementProvider) BuildNodeServiceIndex(ctx context.Context) (map[string]map[string]struct{}, error) {
-	// "" means all namespaces
+	log.Printf("[PLACEMENT][K8S] building node-service index")
+
 	pods, err := p.clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
 	if err != nil {
+		log.Printf("[PLACEMENT][K8S][ERROR] failed to list pods error=%v", err)
 		return nil, err
 	}
 
 	index := make(map[string]map[string]struct{})
+	scheduledPods := 0
 
 	for _, pod := range pods.Items {
 		node := pod.Spec.NodeName
 		if node == "" {
-			continue // not scheduled yet
+			continue
 		}
+		scheduledPods++
 
-		labels := pod.Labels
-		svc := serviceNameFromLabels(labels)
+		svc := serviceNameFromLabels(pod.Labels)
 		if svc == "" {
 			continue
 		}
@@ -73,18 +86,24 @@ func (p *K8sPlacementProvider) BuildNodeServiceIndex(ctx context.Context) (map[s
 		index[node][svc] = struct{}{}
 	}
 
+	log.Printf(
+		"[PLACEMENT][K8S] index built nodes=%d scheduledPods=%d",
+		len(index),
+		scheduledPods,
+	)
+
 	return index, nil
 }
 
 func serviceNameFromLabels(labels map[string]string) string {
 	// Try common Kubernetes conventions
-	if v := labels["app.kubernetes.io/name"]; v != "" {
+	if v := labels["extender.kubernetes.io/name"]; v != "" {
 		return v
 	}
-	if v := labels["app"]; v != "" {
+	if v := labels["extender"]; v != "" {
 		return v
 	}
-	if v := labels["k8s-app"]; v != "" {
+	if v := labels["k8s-extender"]; v != "" {
 		return v
 	}
 	return ""

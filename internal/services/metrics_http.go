@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"time"
@@ -22,14 +23,26 @@ func NewHTTPMetricsProvider(baseURL string, timeout time.Duration) *HTTPMetricsP
 }
 
 func (p *HTTPMetricsProvider) GetHealth(ctx context.Context) (GraphHealth, error) {
+	log.Printf("[METRICS][HTTP] fetching metrics health")
+
 	var out GraphHealth
 	if err := p.getJSON(ctx, "/graph/health", &out); err != nil {
+		log.Printf("[METRICS][HTTP][WARN] health check failed error=%v", err)
 		return GraphHealth{}, err
 	}
+
+	log.Printf("[METRICS][HTTP] health status=%s stale=%v", out.Status, out.Stale)
 	return out, nil
 }
 
 func (p *HTTPMetricsProvider) GetPeers(ctx context.Context, serviceName string, direction string, limit int) (PeersResponse, error) {
+	log.Printf(
+		"[METRICS][HTTP] fetching peers service=%s direction=%s limit=%d",
+		serviceName,
+		direction,
+		limit,
+	)
+
 	q := url.Values{}
 	q.Set("direction", direction)
 	q.Set("limit", fmt.Sprintf("%d", limit))
@@ -38,22 +51,28 @@ func (p *HTTPMetricsProvider) GetPeers(ctx context.Context, serviceName string, 
 
 	var out PeersResponse
 	if err := p.getJSON(ctx, path, &out); err != nil {
+		log.Printf("[METRICS][HTTP][WARN] failed to fetch peers error=%v", err)
 		return PeersResponse{}, err
 	}
+
+	log.Printf("[METRICS][HTTP] peers fetched count=%d", len(out.Peers))
 	return out, nil
 }
 
 func (p *HTTPMetricsProvider) GetCentrality(ctx context.Context) (CentralityResponse, error) {
+	log.Printf("[METRICS][HTTP] fetching centrality scores")
+
 	var out CentralityResponse
 	if err := p.getJSON(ctx, "/centrality", &out); err != nil {
+		log.Printf("[METRICS][HTTP][WARN] failed to fetch centrality error=%v", err)
 		return CentralityResponse{}, err
 	}
+
+	log.Printf("[METRICS][HTTP] centrality entries=%d", len(out.Scores))
 	return out, nil
 }
 
 func (p *HTTPMetricsProvider) GetNodePenalty(ctx context.Context, nodeName string) (float64, error) {
-	// Leader API does not provide node penalty yet.
-	// Keep same deterministic logic for now.
 	switch nodeName {
 	case "minikube":
 		return 0.30, nil

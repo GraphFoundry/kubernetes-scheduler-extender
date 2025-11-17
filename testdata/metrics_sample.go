@@ -1,9 +1,9 @@
-package services
+package testdata
 
 import (
 	"context"
+	"scheduler-extender/internal/services"
 	"strings"
-	"time"
 )
 
 // SampleMetricsProvider returns stable sample metrics from within this repo.
@@ -14,10 +14,10 @@ func NewSampleMetricsProvider() *SampleMetricsProvider {
 	return &SampleMetricsProvider{}
 }
 
-func (p *SampleMetricsProvider) GetHealth(ctx context.Context) (GraphHealth, error) {
+func (p *SampleMetricsProvider) GetHealth(ctx context.Context) (services.GraphHealth, error) {
 	// Always healthy and fresh in sample data
 	secs := 10
-	return GraphHealth{
+	return services.GraphHealth{
 		Status:                "OK",
 		LastUpdatedSecondsAgo: &secs,
 		WindowMinutes:         5,
@@ -25,7 +25,7 @@ func (p *SampleMetricsProvider) GetHealth(ctx context.Context) (GraphHealth, err
 	}, nil
 }
 
-func (p *SampleMetricsProvider) GetPeers(ctx context.Context, serviceName string, direction string, limit int) (PeersResponse, error) {
+func (p *SampleMetricsProvider) GetPeers(ctx context.Context, serviceName string, direction string, limit int) (services.PeersResponse, error) {
 	// Normalize direction
 	dir := strings.ToLower(direction)
 	if dir != "in" && dir != "out" {
@@ -36,10 +36,10 @@ func (p *SampleMetricsProvider) GetPeers(ctx context.Context, serviceName string
 	}
 
 	// Stable sample peers for demo/testing
-	peers := []Peer{
+	peers := []services.Peer{
 		{
-			Service: "paymentservice",
-			Metrics: PeerMetrics{
+			Service: "samplepaymentservice",
+			Metrics: services.PeerMetrics{
 				Rate:      20,
 				P50:       12,
 				P95:       80,
@@ -49,7 +49,7 @@ func (p *SampleMetricsProvider) GetPeers(ctx context.Context, serviceName string
 		},
 		{
 			Service: "shippingservice",
-			Metrics: PeerMetrics{
+			Metrics: services.PeerMetrics{
 				Rate:      8,
 				P50:       25,
 				P95:       120,
@@ -59,7 +59,7 @@ func (p *SampleMetricsProvider) GetPeers(ctx context.Context, serviceName string
 		},
 		{
 			Service: "inventoryservice",
-			Metrics: PeerMetrics{
+			Metrics: services.PeerMetrics{
 				Rate:      5,
 				P50:       15,
 				P95:       60,
@@ -73,7 +73,7 @@ func (p *SampleMetricsProvider) GetPeers(ctx context.Context, serviceName string
 		peers = peers[:limit]
 	}
 
-	return PeersResponse{
+	return services.PeersResponse{
 		Service:       serviceName,
 		Direction:     dir,
 		WindowMinutes: 5,
@@ -81,33 +81,14 @@ func (p *SampleMetricsProvider) GetPeers(ctx context.Context, serviceName string
 	}, nil
 }
 
-func (p *SampleMetricsProvider) GetCentrality(ctx context.Context) (CentralityResponse, error) {
+func (p *SampleMetricsProvider) GetCentrality(ctx context.Context) (services.CentralityResponse, error) {
 	// Sample centrality values
-	return CentralityResponse{
+	return services.CentralityResponse{
 		WindowMinutes: 5,
-		Scores: []CentralityScore{
+		Scores: []services.CentralityScore{
 			{Service: "frontend", Pagerank: 0.65, Betweenness: 0.40},
 			{Service: "checkoutservice", Pagerank: 0.80, Betweenness: 0.55},
-			{Service: "paymentservice", Pagerank: 0.70, Betweenness: 0.45},
+			{Service: "samplepaymentservice", Pagerank: 0.70, Betweenness: 0.45},
 		},
 	}, nil
-}
-
-func (p *SampleMetricsProvider) GetNodePenalty(ctx context.Context, nodeName string) (float64, error) {
-	// Lower is better. This helps create deterministic scheduling behavior in local tests.
-	switch nodeName {
-	case "minikube":
-		return 0.30, nil
-	case "minikube-m02":
-		return 0.10, nil
-	case "minikube-m03":
-		return 0.00, nil
-	default:
-		return 0.20, nil
-	}
-}
-
-// Optional helper if you later want a “generated at” feel
-func unixNow() int64 {
-	return time.Now().Unix()
 }

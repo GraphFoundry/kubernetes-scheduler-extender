@@ -1,9 +1,16 @@
 package models
 
 type ExtenderArgs struct {
-	Pod       interface{} `json:"pod"`
-	Nodes     *NodeList   `json:"nodes"`
-	NodeNames *[]string   `json:"nodenames"`
+	Pod       *PodRef   `json:"pod"`
+	Nodes     *NodeList `json:"nodes"`
+	NodeNames *[]string `json:"nodenames"`
+}
+
+type PodRef struct {
+	Namespace string            `json:"namespace"`
+	Name      string            `json:"name"`
+	UID       string            `json:"uid"`
+	Labels    map[string]string `json:"labels,omitempty"`
 }
 
 type NodeList struct {

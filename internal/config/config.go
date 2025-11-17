@@ -11,7 +11,7 @@ type ProviderType string
 
 const (
 	ProviderSample ProviderType = "sample"
-	ProviderHTTP   ProviderType = "http" // will be implemented when leader provides endpoint
+	ProviderHTTP   ProviderType = "http"
 )
 
 type Config struct {
@@ -29,17 +29,21 @@ type Config struct {
 
 	// Target service id for now (later you can derive from pod labels/annotations)
 	TargetServiceID string
+
+	//Redis
+	RedisAddr string
 }
 
 func Load() (Config, error) {
 	cfg := Config{
 		Port:              getEnv("PORT", "9000"),
-		MetricsProvider:   ProviderType(getEnv("METRICS_PROVIDER", string(ProviderSample))),
-		MetricsBaseURL:    getEnv("METRICS_BASE_URL", "http://localhost:9090"),
+		MetricsProvider:   ProviderType(getEnv("METRICS_PROVIDER", string(ProviderHTTP))),
+		MetricsBaseURL:    getEnv("METRICS_BASE_URL", "http://localhost:3000"),
 		MetricsTimeout:    getDurationMs("METRICS_TIMEOUT_MS", 1200),
 		TimeWindowSeconds: getInt("TIME_WINDOW_SECONDS", 300),
 		TopKPeers:         getInt("TOPK_PEERS", 5),
 		TargetServiceID:   getEnv("TARGET_SERVICE_ID", "default:checkoutservice"),
+		RedisAddr:         getEnv("REDIS_ADDR", "localhost:6379"),
 	}
 
 	if cfg.MetricsProvider != ProviderSample && cfg.MetricsProvider != ProviderHTTP {
