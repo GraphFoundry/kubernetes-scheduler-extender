@@ -53,7 +53,7 @@ func runOnce(
 	}
 
 	if len(nodeServiceIndex) == 0 {
-		log.Printf("[SCORER][WARN] no scheduled pods found")
+		log.Printf("[SCORER][WARN] no scheduled pods with service labels found")
 		return
 	}
 

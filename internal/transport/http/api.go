@@ -13,6 +13,7 @@ import (
 // DecisionReader matches app.DecisionReader
 type DecisionReader interface {
 	Get(ctx context.Context, namespace, service string) (*models.Decision, error)
+	List(ctx context.Context, namespace string) ([]*models.Decision, error)
 }
 
 type API struct {
@@ -61,7 +62,19 @@ func (a *API) Prioritize(w http.ResponseWriter, r *http.Request) {
 		namespace = args.Pod.Namespace
 	}
 
-	service := a.targetService
+	service := ""
+
+	if args.Pod != nil {
+		if v, ok := args.Pod.Labels["extender.kubernetes.io/name"]; ok {
+			service = v
+		}
+	}
+
+	if service == "" {
+		log.Printf("[HTTP][PRIORITIZE][WARN] service label missing, using neutral scores")
+		writeJSON(w, neutral(nodes))
+		return
+	}
 
 	log.Printf(
 		"[HTTP][PRIORITIZE] resolving decision namespace=%s service=%s nodes=%d",
@@ -86,6 +99,21 @@ func (a *API) Prioritize(w http.ResponseWriter, r *http.Request) {
 	)
 
 	writeJSON(w, out)
+}
+
+func (a *API) ListDecisions(w http.ResponseWriter, r *http.Request) {
+	namespace := r.URL.Query().Get("namespace")
+	if namespace == "" {
+		namespace = "default"
+	}
+
+	decisions, err := a.repo.List(r.Context(), namespace)
+	if err != nil {
+		http.Error(w, "failed to load decisions", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, decisions)
 }
 
 /* ---------------- helpers ---------------- */
@@ -123,6 +151,8 @@ func extractNodeNames(args models.ExtenderArgs) []string {
 		nodes := make([]string, 0, len(args.Nodes.Items))
 		for _, n := range args.Nodes.Items {
 			nodes = append(nodes, n.Metadata.Name)
+			log.Printf(
+				"[API][DEBUG] node=%s ", n.Metadata.Name)
 		}
 		return nodes
 	}

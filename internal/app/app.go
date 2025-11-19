@@ -16,6 +16,7 @@ type App struct {
 }
 type DecisionReader interface {
 	Get(ctx context.Context, namespace, service string) (*models.Decision, error)
+	List(ctx context.Context, namespace string) ([]*models.Decision, error)
 }
 
 func New(cfg config.Config, repo DecisionReader) *App {
@@ -35,6 +36,7 @@ func (a *App) Run() error {
 	router := httptransport.NewRouter(httptransport.Handlers{
 		Health:     api.Health,
 		Prioritize: api.Prioritize,
+		List:       api.ListDecisions,
 	})
 
 	server := &http.Server{

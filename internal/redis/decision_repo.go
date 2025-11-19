@@ -69,3 +69,43 @@ func (r *DecisionRepository) Get(
 
 	return &d, nil
 }
+
+// List returns all decisions for a namespace
+func (r *DecisionRepository) List(
+	ctx context.Context,
+	namespace string,
+) ([]*models.Decision, error) {
+
+	pattern := fmt.Sprintf("scheduler:decision:%s:*", namespace)
+
+	var cursor uint64
+	out := make([]*models.Decision, 0)
+
+	for {
+		keys, next, err := r.rdb.Scan(ctx, cursor, pattern, 50).Result()
+		if err != nil {
+			return nil, err
+		}
+
+		for _, key := range keys {
+			val, err := r.rdb.Get(ctx, key).Result()
+			if err != nil {
+				continue // skip expired / race
+			}
+
+			var d models.Decision
+			if err := json.Unmarshal([]byte(val), &d); err != nil {
+				continue
+			}
+
+			out = append(out, &d)
+		}
+
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+
+	return out, nil
+}

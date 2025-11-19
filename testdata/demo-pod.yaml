@@ -1,21 +1,10 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: demo-cart
+  name: demo-test
   labels:
-    extender.kubernetes.io/name: cartservice
+    extender.kubernetes.io/name: test
 spec:
   containers:
     - name: nginx
       image: nginx
-#---
-#apiVersion: v1
-#kind: Pod
-#metadata:
-#  name: demo-checkout
-#  labels:
-#    extender.kubernetes.io/name: checkoutservice
-#spec:
-#  containers:
-#    - name: nginx
-#      image: nginx

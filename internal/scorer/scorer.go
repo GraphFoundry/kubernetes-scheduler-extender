@@ -44,7 +44,7 @@ func (s *Scorer) ComputeForService(
 
 	log.Printf("[SCORER] compute start service=%s nodes=%d", service, len(nodes))
 
-	// 1️⃣ Metrics health check
+	//  Metrics health check
 	health, err := s.metrics.GetHealth(ctx)
 	if err != nil {
 		log.Printf("[SCORER][WARN] metrics health failed service=%s error=%v", service, err)
@@ -55,7 +55,7 @@ func (s *Scorer) ComputeForService(
 		//return
 	}
 
-	// 2️⃣ Fetch peers
+	//  Fetch peers
 	outPeers, err := s.metrics.GetPeers(ctx, service, "out", 5)
 	if err != nil {
 		log.Printf("[SCORER][WARN] outgoing peers failed service=%s error=%v", service, err)
@@ -84,7 +84,7 @@ func (s *Scorer) ComputeForService(
 		)
 	}
 
-	// 3️⃣ Placement index
+	// Placement index
 	nodeServiceIndex, err := s.placement.BuildNodeServiceIndex(ctx)
 	if err != nil {
 		log.Printf("[SCORER][WARN] placement lookup failed service=%s error=%v", service, err)
@@ -101,7 +101,7 @@ func (s *Scorer) ComputeForService(
 		}
 	}
 
-	// 4️⃣ Centrality
+	// Centrality
 	centrality, err := s.metrics.GetCentrality(ctx)
 	if err != nil {
 		log.Printf("[SCORER][WARN] centrality failed service=%s error=%v", service, err)
@@ -119,7 +119,7 @@ func (s *Scorer) ComputeForService(
 		importance,
 	)
 
-	// 5️⃣ Raw scoring
+	// ⃣Raw scoring
 	rawScores := make(map[string]float64)
 	var maxRaw float64
 
@@ -181,7 +181,7 @@ func (s *Scorer) ComputeForService(
 			Namespace:     namespace,
 			Service:       service,
 			CurrentNode:   currentNode,
-			BestNode:      currentNode, // neutral
+			BestNode:      currentNode,
 			Scores:        scores,
 			EvaluatedAt:   time.Now().UTC(),
 			WindowSeconds: windowSeconds,
@@ -191,7 +191,7 @@ func (s *Scorer) ComputeForService(
 		return
 	}
 
-	// 6️⃣ Normalize to 0–100
+	//  Normalize to 0–100
 	scores := make(map[string]int)
 	bestNode := ""
 	bestScore := -1
@@ -206,7 +206,7 @@ func (s *Scorer) ComputeForService(
 		}
 	}
 
-	// 7️⃣ Determine current node (if already running)
+	//  Determine current node (if already running)
 	currentNode := ""
 	for node, svcs := range nodeServiceIndex {
 		if _, ok := svcs[strings.ToLower(service)]; ok {
@@ -218,6 +218,7 @@ func (s *Scorer) ComputeForService(
 	decision := &models.Decision{
 		Namespace:     namespace,
 		Service:       service,
+		Status:        "Scheduled",
 		CurrentNode:   currentNode,
 		BestNode:      bestNode,
 		Scores:        scores,
