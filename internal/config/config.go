@@ -38,12 +38,12 @@ func Load() (Config, error) {
 	cfg := Config{
 		Port:              getEnv("PORT", "9000"),
 		MetricsProvider:   ProviderType(getEnv("METRICS_PROVIDER", string(ProviderHTTP))),
-		MetricsBaseURL:    getEnv("METRICS_BASE_URL", "http://localhost:3000"),
+		MetricsBaseURL:    getEnv("METRICS_BASE_URL", "http://service-graph-engine.default.svc.cluster.local:3000"),
 		MetricsTimeout:    getDurationMs("METRICS_TIMEOUT_MS", 1200),
 		TimeWindowSeconds: getInt("TIME_WINDOW_SECONDS", 300),
 		TopKPeers:         getInt("TOPK_PEERS", 5),
 		TargetServiceID:   getEnv("TARGET_SERVICE_ID", "default:checkoutservice"),
-		RedisAddr:         getEnv("REDIS_ADDR", "localhost:6379"),
+		RedisAddr:         getEnv("REDIS_ADDR", "redis.default.svc.cluster.local:6379"),
 	}
 
 	if cfg.MetricsProvider != ProviderSample && cfg.MetricsProvider != ProviderHTTP {

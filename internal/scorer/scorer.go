@@ -70,7 +70,28 @@ func (s *Scorer) ComputeForService(
 
 	peers := append(outPeers.Peers, inPeers.Peers...)
 	if len(peers) == 0 {
-		log.Printf("[SCORER][WARN] no peers found service=%s", service)
+		log.Printf("[SCORER][WARN] no peers found service=%s — writing neutral decision", service)
+
+		nodeServiceIndex, _ := s.placement.BuildNodeServiceIndex(ctx)
+		currentNodes := getCurrentNodes(nodeServiceIndex, service)
+
+		scores := make(map[string]int)
+		for _, node := range nodes {
+			scores[node] = 50
+		}
+
+		decision := &models.Decision{
+			Namespace:     namespace,
+			Service:       service,
+			Status:        models.StatusScheduled,
+			CurrentNodes:  currentNodes,
+			BestNode:      "", //NO PREFERENCE
+			Scores:        scores,
+			EvaluatedAt:   time.Now().UTC(),
+			WindowSeconds: windowSeconds,
+		}
+
+		_ = s.repo.Save(ctx, decision)
 		return
 	}
 
@@ -164,24 +185,19 @@ func (s *Scorer) ComputeForService(
 	if maxRaw <= 0.000001 {
 		log.Printf("[SCORER][WARN] all raw scores zero service=%s — writing neutral decision", service)
 
+		currentNodes := getCurrentNodes(nodeServiceIndex, service)
+
 		scores := make(map[string]int)
 		for _, node := range nodes {
 			scores[node] = 50
 		}
 
-		currentNode := ""
-		for node, svcs := range nodeServiceIndex {
-			if _, ok := svcs[strings.ToLower(service)]; ok {
-				currentNode = node
-				break
-			}
-		}
-
 		decision := &models.Decision{
 			Namespace:     namespace,
 			Service:       service,
-			CurrentNode:   currentNode,
-			BestNode:      currentNode,
+			Status:        models.StatusScheduled,
+			CurrentNodes:  currentNodes,
+			BestNode:      "", // NO PREFERENCE
 			Scores:        scores,
 			EvaluatedAt:   time.Now().UTC(),
 			WindowSeconds: windowSeconds,
@@ -195,6 +211,7 @@ func (s *Scorer) ComputeForService(
 	scores := make(map[string]int)
 	bestNode := ""
 	bestScore := -1
+	tie := false
 
 	for node, raw := range rawScores {
 		score := int(math.Round(clamp((raw/maxRaw)*100.0, 0, 100)))
@@ -203,24 +220,24 @@ func (s *Scorer) ComputeForService(
 		if score > bestScore {
 			bestScore = score
 			bestNode = node
+			tie = false
+		} else if score == bestScore {
+			tie = true
 		}
 	}
 
-	//  Determine current node (if already running)
-	currentNode := ""
-	for node, svcs := range nodeServiceIndex {
-		if _, ok := svcs[strings.ToLower(service)]; ok {
-			currentNode = node
-			break
-		}
+	if tie {
+		bestNode = "" // ✅ no deterministic winner
 	}
+
+	currentNodes := getCurrentNodes(nodeServiceIndex, service)
 
 	decision := &models.Decision{
 		Namespace:     namespace,
 		Service:       service,
-		Status:        "Scheduled",
-		CurrentNode:   currentNode,
-		BestNode:      bestNode,
+		Status:        models.StatusScheduled,
+		CurrentNodes:  currentNodes,
+		BestNode:      bestNode, // only set if unique winner
 		Scores:        scores,
 		EvaluatedAt:   time.Now().UTC(),
 		WindowSeconds: windowSeconds,
@@ -232,15 +249,28 @@ func (s *Scorer) ComputeForService(
 	}
 
 	log.Printf(
-		"[SCORER] compute done service=%s best=%s current=%s duration_ms=%d",
+		"[SCORER] compute done service=%s best=%s current nodes=%s duration_ms=%d",
 		service,
 		bestNode,
-		currentNode,
+		currentNodes,
 		time.Since(start).Milliseconds(),
 	)
 }
 
 /* ================= helpers (unchanged math) ================= */
+
+func getCurrentNodes(
+	index map[string]map[string]struct{},
+	service string,
+) []string {
+	nodes := []string{}
+	for node, svcs := range index {
+		if _, ok := svcs[strings.ToLower(service)]; ok {
+			nodes = append(nodes, node)
+		}
+	}
+	return nodes
+}
 
 func hasService(index map[string]map[string]struct{}, node, service string) bool {
 	set, ok := index[node]

@@ -8,9 +8,16 @@ type Decision struct {
 	Namespace     string         `json:"namespace"`
 	Service       string         `json:"service"`
 	Status        string         `json:"status"`
-	CurrentNode   string         `json:"currentNode"`
+	CurrentNodes  []string       `json:"currentNodes"`
 	BestNode      string         `json:"bestNode"`
 	Scores        map[string]int `json:"scores"`
 	EvaluatedAt   time.Time      `json:"evaluatedAt"`
 	WindowSeconds int            `json:"windowSeconds"`
 }
+
+const (
+	StatusScheduled = "Scheduled"
+	StatusNoPeers   = "NoPeers"
+	StatusNoMetrics = "NoMetrics"
+	StatusStale     = "StaleMetrics"
+)
