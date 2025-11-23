@@ -95,15 +95,15 @@ func (s *Scorer) ComputeForService(
 		return
 	}
 
-	for _, p := range peers {
-		log.Printf(
-			"[SCORER][DEBUG] peer service=%s rate=%.2f p95=%.2f errorRate=%.4f",
-			p.Service,
-			p.Metrics.Rate,
-			p.Metrics.P95,
-			p.Metrics.ErrorRate,
-		)
-	}
+	//for _, p := range peers {
+	//	log.Printf(
+	//		"[SCORER][DEBUG] peer service=%s rate=%.2f p95=%.2f errorRate=%.4f",
+	//		p.Service,
+	//		p.Metrics.Rate,
+	//		p.Metrics.P95,
+	//		p.Metrics.ErrorRate,
+	//	)
+	//}
 
 	// Placement index
 	nodeServiceIndex, err := s.placement.BuildNodeServiceIndex(ctx)
@@ -112,15 +112,15 @@ func (s *Scorer) ComputeForService(
 		return
 	}
 
-	for node, svcs := range nodeServiceIndex {
-		for svc := range svcs {
-			log.Printf(
-				"[SCORER][DEBUG] placement node=%s service=%s",
-				node,
-				svc,
-			)
-		}
-	}
+	//for node, svcs := range nodeServiceIndex {
+	//	for svc := range svcs {
+	//		log.Printf(
+	//			"[SCORER][DEBUG] placement node=%s service=%s",
+	//			node,
+	//			svc,
+	//		)
+	//	}
+	//}
 
 	// Centrality
 	centrality, err := s.metrics.GetCentrality(ctx)
@@ -154,12 +154,12 @@ func (s *Scorer) ComputeForService(
 				w := peerWeight(p)
 				raw += w
 
-				log.Printf(
-					"[SCORER][DEBUG] MATCH node=%s peer=%s weight=%.4f",
-					node,
-					peerName,
-					w,
-				)
+				//log.Printf(
+				//	"[SCORER][DEBUG] MATCH node=%s peer=%s weight=%.4f",
+				//	node,
+				//	peerName,
+				//	w,
+				//)
 			} else {
 				log.Printf(
 					"[SCORER][DEBUG] NO_MATCH node=%s peer=%s",

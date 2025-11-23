@@ -36,12 +36,12 @@ func (p *HTTPMetricsProvider) GetHealth(ctx context.Context) (GraphHealth, error
 }
 
 func (p *HTTPMetricsProvider) GetPeers(ctx context.Context, serviceName string, direction string, limit int) (PeersResponse, error) {
-	log.Printf(
-		"[METRICS][HTTP] fetching peers service=%s direction=%s limit=%d",
-		serviceName,
-		direction,
-		limit,
-	)
+	//log.Printf(
+	//	"[METRICS][HTTP] fetching peers service=%s direction=%s limit=%d",
+	//	serviceName,
+	//	direction,
+	//	limit,
+	//)
 
 	q := url.Values{}
 	q.Set("direction", direction)
