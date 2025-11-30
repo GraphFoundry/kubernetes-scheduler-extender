@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: test-replicaset
+  labels:
+    app: test-replicaset
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: test-replicaset
+  template:
+    metadata:
+      labels:
+        app: test-replicaset
+    spec:
+      schedulerName: my-scheduler
+      containers:
+        - name: nginx
+          image: nginx:alpine
