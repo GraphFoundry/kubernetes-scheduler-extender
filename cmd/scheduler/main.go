@@ -24,7 +24,7 @@ import (
 const (
 	schedulerName = "my-scheduler"
 	// host.minikube.internal resolves to the host machine from within Minikube
-	extenderURL = "http://host.minikube.internal:3001/prioritize"
+	extenderURL = "http://host.minikube.internal:9000/prioritize"
 )
 
 func main() {
@@ -72,33 +72,30 @@ func main() {
 		time.Sleep(2 * time.Second)
 	}
 }
-
 func schedulePod(clientset *kubernetes.Clientset, pod *v1.Pod) error {
-	nodes, err := clientset.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
+	ctx := context.TODO()
+	nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return fmt.Errorf("failed to list nodes: %v", err)
+		return fmt.Errorf("failed to list nodes: %w", err)
 	}
 
 	if len(nodes.Items) == 0 {
-		return fmt.Errorf("no nodes available")
+		return fmt.Errorf("no nodes available for scheduling pod %s/%s", pod.Namespace, pod.Name)
 	}
 
-	// 1. Call Extender (Host Machine)
-	fmt.Printf("Calling extender at %s for pod %s\n", extenderURL, pod.Name)
-	// We'll send the pod name or some data. For now, just firing a request to check connectivity/logic.
-	// In a real scenario, we'd send the pod and node list.
-	// Here we just "check" with the extender.
+	nodeNames := make([]string, len(nodes.Items))
+	for i, node := range nodes.Items {
+		nodeNames[i] = node.Name
+	}
+	log.Printf("Scheduling pod %s/%s. Available nodes: %v", pod.Namespace, pod.Name, nodeNames)
+
 	if err := callExtender(pod, nodes.Items); err != nil {
-		log.Printf("Extender failed: %v. Proceeding with default logic.\n", err)
-		// We can decide to fail or fallback. For now, fallback.
-	} else {
-		log.Printf("Extender call successful.\n")
+		log.Printf("Extender at %s failed for pod %s/%s: %v. Falling back to random selection.", extenderURL, pod.Namespace, pod.Name, err)
 	}
 
-	// 2. Select Node (Simple logic)
 	selectedNode := nodes.Items[rand.Intn(len(nodes.Items))]
+	log.Printf("Selected node %s for pod %s/%s", selectedNode.Name, pod.Namespace, pod.Name)
 
-	// 3. Bind
 	binding := &v1.Binding{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      pod.Name,
@@ -111,7 +108,7 @@ func schedulePod(clientset *kubernetes.Clientset, pod *v1.Pod) error {
 		},
 	}
 
-	return clientset.CoreV1().Pods(pod.Namespace).Bind(context.TODO(), binding, metav1.CreateOptions{})
+	return clientset.CoreV1().Pods(pod.Namespace).Bind(ctx, binding, metav1.CreateOptions{})
 }
 
 func callExtender(pod *v1.Pod, nodes []v1.Node) error {
