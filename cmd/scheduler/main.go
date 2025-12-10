@@ -89,12 +89,14 @@ func schedulePod(clientset *kubernetes.Clientset, pod *v1.Pod) error {
 	}
 	log.Printf("Scheduling pod %s/%s. Available nodes: %v", pod.Namespace, pod.Name, nodeNames)
 
-	if err := callExtender(pod, nodes.Items); err != nil {
+	// Call extender to get the best node
+	selectedNode, err := callExtender(pod, nodes.Items)
+	if err != nil {
 		log.Printf("Extender at %s failed for pod %s/%s: %v. Falling back to random selection.", extenderURL, pod.Namespace, pod.Name, err)
+		selectedNode = nodes.Items[rand.Intn(len(nodes.Items))].Name
 	}
-
-	selectedNode := nodes.Items[rand.Intn(len(nodes.Items))]
-	log.Printf("Selected node %s for pod %s/%s", selectedNode.Name, pod.Namespace, pod.Name)
+	
+	log.Printf("Selected node %s for pod %s/%s", selectedNode, pod.Namespace, pod.Name)
 
 	binding := &v1.Binding{
 		ObjectMeta: metav1.ObjectMeta{
@@ -104,17 +106,15 @@ func schedulePod(clientset *kubernetes.Clientset, pod *v1.Pod) error {
 		Target: v1.ObjectReference{
 			APIVersion: "v1",
 			Kind:       "Node",
-			Name:       selectedNode.Name,
+			Name:       selectedNode,
 		},
 	}
 
 	return clientset.CoreV1().Pods(pod.Namespace).Bind(ctx, binding, metav1.CreateOptions{})
 }
 
-func callExtender(pod *v1.Pod, nodes []v1.Node) error {
-	// Construct a simple payload. The actual payload depends on the extender's expectation.
-	// Based on "Prioritize", it likely expects ExtenderArgs.
-	// We'll send a dummy valid JSON to just trigger the endpoint.
+func callExtender(pod *v1.Pod, nodes []v1.Node) (string, error) {
+	// Construct ExtenderArgs payload matching models.ExtenderArgs
 	payload := map[string]interface{}{
 		"Pod":   pod,
 		"Nodes": nodes,
@@ -123,21 +123,53 @@ func callExtender(pod *v1.Pod, nodes []v1.Node) error {
 
 	req, err := http.NewRequest("POST", extenderURL, bytes.NewBuffer(body))
 	if err != nil {
-		return err
+		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("extender returned status %d: %s", resp.StatusCode, string(bodyBytes))
+		return "", fmt.Errorf("extender returned status %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 
-	return nil
+	// Parse response (array of HostPriority)
+	var priorities []struct {
+		Host  string `json:"host"`
+		Score int    `json:"score"`
+	}
+	
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	
+	if err := json.Unmarshal(bodyBytes, &priorities); err != nil {
+		return "", fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	
+	if len(priorities) == 0 {
+		return "", fmt.Errorf("no priorities returned from extender")
+	}
+	
+	// Find node with highest score
+	bestNode := priorities[0].Host
+	bestScore := priorities[0].Score
+	
+	for _, p := range priorities[1:] {
+		if p.Score > bestScore {
+			bestScore = p.Score
+			bestNode = p.Host
+		}
+	}
+	
+	log.Printf("Extender selected node %s with score %d", bestNode, bestScore)
+	
+	return bestNode, nil
 }
