@@ -6,14 +6,17 @@ import (
 	"net/http"
 	"scheduler-extender/internal/config"
 	"scheduler-extender/internal/models"
+	"scheduler-extender/internal/scheduler"
 	httptransport "scheduler-extender/internal/transport/http"
 	"time"
 )
 
 type App struct {
-	cfg  config.Config
-	repo DecisionReader
+	cfg       config.Config
+	repo      DecisionReader
+	scheduler *scheduler.Scheduler
 }
+
 type DecisionReader interface {
 	Get(ctx context.Context, namespace, service string) (*models.Decision, error)
 	List(ctx context.Context, namespace string) ([]*models.Decision, error)
@@ -26,9 +29,18 @@ func New(cfg config.Config, repo DecisionReader) *App {
 	}
 }
 
+func NewWithScheduler(cfg config.Config, repo DecisionReader, sched *scheduler.Scheduler) *App {
+	return &App{
+		cfg:       cfg,
+		repo:      repo,
+		scheduler: sched,
+	}
+}
+
 func (a *App) Run() error {
 	api := httptransport.NewAPI(
 		a.repo,
+		a.scheduler, // May be nil for legacy mode
 		a.cfg.TopKPeers,
 		a.cfg.TargetServiceID,
 	)
@@ -45,7 +57,12 @@ func (a *App) Run() error {
 		ReadHeaderTimeout: 3 * time.Second,
 	}
 
-	log.Printf("[APP] scheduler-extender listening on :%s", a.cfg.Port)
+	if a.scheduler != nil {
+		log.Printf("[APP] scheduler-extender listening on :%s (mode=production-grade)", a.cfg.Port)
+	} else {
+		log.Printf("[APP] scheduler-extender listening on :%s (mode=legacy)", a.cfg.Port)
+	}
+	
 	return server.ListenAndServe()
 }
 
