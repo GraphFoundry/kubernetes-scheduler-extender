@@ -1,9 +1,11 @@
 package models
 
+import v1 "k8s.io/api/core/v1"
+
 type ExtenderArgs struct {
-	Pod       *PodRef   `json:"pod"`
-	Nodes     *NodeList `json:"nodes"`
-	NodeNames *[]string `json:"nodenames"`
+	Pod       v1.Pod     `json:"Pod"`
+	Nodes     []v1.Node  `json:"Nodes"`
+	NodeNames *[]string  `json:"nodenames"`
 }
 
 type PodRef struct {
@@ -14,7 +16,7 @@ type PodRef struct {
 }
 
 type NodeList struct {
-	Items []Node `json:"items"`
+	Items []v1.Node `json:"items"`
 }
 
 type Node struct {
@@ -26,7 +28,7 @@ type Metadata struct {
 }
 
 type ExtenderFilterResult struct {
-	Nodes       *NodeList         `json:"nodes,omitempty"`
+	Nodes       []v1.Node         `json:"nodes,omitempty"`
 	NodeNames   *[]string         `json:"nodenames,omitempty"`
 	FailedNodes map[string]string `json:"failedNodes,omitempty"`
 	Error       string            `json:"error,omitempty"`
