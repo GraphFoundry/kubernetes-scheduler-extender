@@ -15,20 +15,22 @@ func Start(
 	scorer *Scorer,
 	placement services.PlacementProvider,
 	windowSeconds int,
+	namespaces []string,
 ) {
 	ticker := time.NewTicker(defaultInterval)
 	defer ticker.Stop()
 
 	log.Printf(
-		"[SCORER] background scorer started interval=%s windowSeconds=%d",
+		"[SCORER] background scorer started interval=%s windowSeconds=%d namespaces=%v",
 		defaultInterval,
 		windowSeconds,
+		namespaces,
 	)
 
 	for {
 		select {
 		case <-ticker.C:
-			runOnce(ctx, scorer, placement, windowSeconds)
+			runOnce(ctx, scorer, placement, windowSeconds, namespaces)
 
 		case <-ctx.Done():
 			log.Printf("[SCORER] background scorer stopped")
@@ -42,11 +44,17 @@ func runOnce(
 	scorer *Scorer,
 	placement services.PlacementProvider,
 	windowSeconds int,
+	namespaces []string,
 ) {
 	log.Printf("[SCORER] discovery cycle started")
 
+	// Default to "default" namespace if none specified
+	if len(namespaces) == 0 {
+		namespaces = []string{"default"}
+	}
+
 	// 1️⃣ Build node → services index from Kubernetes
-	nodeServiceIndex, err := placement.BuildNodeServiceIndex(ctx)
+	nodeServiceIndex, err := placement.BuildNodeServiceIndex(ctx, namespaces)
 	if err != nil {
 		log.Printf("[SCORER][ERROR] failed to build node-service index: %v", err)
 		return
@@ -77,12 +85,15 @@ func runOnce(
 	}
 
 	log.Printf(
-		"[SCORER] discovered services=%d nodes=%d",
+		"[SCORER] discovered services=%d nodes=%d namespaces=%v",
 		len(servicesSet),
 		len(nodes),
+		namespaces,
 	)
 
 	// 4️⃣ Compute score for each service
+	// Use first namespace as default for now (could be enhanced to track per-namespace)
+	namespace := namespaces[0]
 	for service := range servicesSet {
 		select {
 		case <-ctx.Done():
@@ -90,7 +101,7 @@ func runOnce(
 		default:
 			scorer.ComputeForService(
 				ctx,
-				"default", // namespace resolution can be added later
+				namespace,
 				service,
 				nodes,
 				windowSeconds,
