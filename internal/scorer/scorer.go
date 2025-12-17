@@ -72,7 +72,7 @@ func (s *Scorer) ComputeForService(
 	if len(peers) == 0 {
 		log.Printf("[SCORER][WARN] no peers found service=%s — writing neutral decision", service)
 
-		nodeServiceIndex, _ := s.placement.BuildNodeServiceIndex(ctx)
+		nodeServiceIndex, _ := s.placement.BuildNodeServiceIndex(ctx, []string{namespace})
 		currentNodes := getCurrentNodes(nodeServiceIndex, service)
 
 		scores := make(map[string]int)
@@ -106,7 +106,7 @@ func (s *Scorer) ComputeForService(
 	//}
 
 	// Placement index
-	nodeServiceIndex, err := s.placement.BuildNodeServiceIndex(ctx)
+	nodeServiceIndex, err := s.placement.BuildNodeServiceIndex(ctx, []string{namespace})
 	if err != nil {
 		log.Printf("[SCORER][WARN] placement lookup failed service=%s error=%v", service, err)
 		return

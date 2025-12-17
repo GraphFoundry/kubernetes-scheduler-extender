@@ -56,34 +56,41 @@ func kubeConfig() (*rest.Config, error) {
 	return clientcmd.BuildConfigFromFlags("", kubeconfig)
 }
 
-func (p *K8sPlacementProvider) BuildNodeServiceIndex(ctx context.Context) (map[string]map[string]struct{}, error) {
-	log.Printf("[PLACEMENT][K8S] building node-service index")
-
-	pods, err := p.clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
-	if err != nil {
-		log.Printf("[PLACEMENT][K8S][ERROR] failed to list pods error=%v", err)
-		return nil, err
-	}
+func (p *K8sPlacementProvider) BuildNodeServiceIndex(ctx context.Context, namespaces []string) (map[string]map[string]struct{}, error) {
+	log.Printf("[PLACEMENT][K8S] building node-service index namespaces=%v", namespaces)
 
 	index := make(map[string]map[string]struct{})
 	scheduledPods := 0
 
-	for _, pod := range pods.Items {
-		node := pod.Spec.NodeName
-		if node == "" {
+	// If no namespaces specified, watch all
+	if len(namespaces) == 0 {
+		namespaces = []string{""}
+	}
+
+	for _, ns := range namespaces {
+		pods, err := p.clientset.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			log.Printf("[PLACEMENT][K8S][ERROR] failed to list pods in namespace=%s error=%v", ns, err)
 			continue
 		}
-		scheduledPods++
 
-		svc := serviceNameFromLabels(pod.Labels)
-		if svc == "" {
-			continue
-		}
+		for _, pod := range pods.Items {
+			node := pod.Spec.NodeName
+			if node == "" {
+				continue
+			}
+			scheduledPods++
 
-		if _, ok := index[node]; !ok {
-			index[node] = make(map[string]struct{})
+			svc := serviceNameFromLabels(pod.Labels)
+			if svc == "" {
+				continue
+			}
+
+			if _, ok := index[node]; !ok {
+				index[node] = make(map[string]struct{})
+			}
+			index[node][svc] = struct{}{}
 		}
-		index[node][svc] = struct{}{}
 	}
 
 	log.Printf(
@@ -104,6 +111,14 @@ func serviceNameFromLabels(labels map[string]string) string {
 		return v
 	}
 	if v := labels["k8s-extender"]; v != "" {
+		return v
+	}
+	// Try Istio canonical name
+	if v := labels["service.istio.io/canonical-name"]; v != "" {
+		return v
+	}
+	// Try standard app label
+	if v := labels["app"]; v != "" {
 		return v
 	}
 	return ""
