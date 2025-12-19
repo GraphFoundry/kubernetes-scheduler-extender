@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"scheduler-extender/internal/models"
+	"scheduler-extender/internal/scheduler"
 )
 
 // DecisionReader matches app.DecisionReader
@@ -18,13 +19,15 @@ type DecisionReader interface {
 
 type API struct {
 	repo          DecisionReader
+	scheduler     *scheduler.Scheduler
 	topK          int
 	targetService string
 }
 
-func NewAPI(repo DecisionReader, topK int, targetService string) *API {
+func NewAPI(repo DecisionReader, sched *scheduler.Scheduler, topK int, targetService string) *API {
 	return &API{
 		repo:          repo,
+		scheduler:     sched,
 		topK:          topK,
 		targetService: targetService,
 	}
@@ -50,6 +53,9 @@ func (a *API) Prioritize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("[HTTP][PRIORITIZE] decoded pod=%s/%s nodes=%d",
+		args.Pod.Namespace, args.Pod.Name, len(args.Nodes))
+
 	nodes := extractNodeNames(args)
 	if len(nodes) == 0 {
 		log.Printf("[HTTP][PRIORITIZE] no nodes provided")
@@ -57,48 +63,64 @@ func (a *API) Prioritize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	namespace := "default"
-	if args.Pod != nil && args.Pod.Namespace != "" {
-		namespace = args.Pod.Namespace
+	// 1. Try to find a precomputed decision for this service
+	namespace := args.Pod.Namespace
+	if namespace == "" {
+		namespace = "default"
 	}
 
 	service := ""
+	if v, ok := args.Pod.Labels["extender.kubernetes.io/name"]; ok {
+		service = v
+	}
 
-	if args.Pod != nil {
-		if v, ok := args.Pod.Labels["extender.kubernetes.io/name"]; ok {
-			service = v
+	// Only look for decision if we have a service name
+	if service != "" {
+		log.Printf(
+			"[HTTP][PRIORITIZE] resolving decision namespace=%s service=%s nodes=%d",
+			namespace,
+			service,
+			len(nodes),
+		)
+
+		decision, err := a.repo.Get(r.Context(), namespace, service)
+		if err == nil {
+			// Found a decision! Use it.
+			out := scoresFromDecision(nodes, decision)
+			log.Printf(
+				"[HTTP][PRIORITIZE] decision found! response sent scoredNodes=%d duration_ms=%d",
+				len(out),
+				time.Since(start).Milliseconds(),
+			)
+			writeJSON(w, out)
+			return
 		}
+
+		log.Printf("[HTTP][PRIORITIZE] decision not found (err=%v), falling back to scheduler", err)
+	} else {
+		log.Printf("[HTTP][PRIORITIZE] service label missing, skipping decision lookup")
 	}
 
-	if service == "" {
-		log.Printf("[HTTP][PRIORITIZE][WARN] service label missing, using neutral scores")
-		writeJSON(w, neutral(nodes))
+	// 2. Fallback to production-grade scheduler
+	if a.scheduler != nil {
+		nodeName, err := a.scheduler.Schedule(r.Context(), &args.Pod, args.Nodes)
+		if err != nil {
+			log.Printf("[HTTP][PRIORITIZE][ERROR] scheduling failed: %v", err)
+			// Fall back to neutral scores
+			writeJSON(w, neutral(nodes))
+			return
+		}
+
+		// Return scores with selected node having highest score
+		scores := generateScoresForNode(nodes, nodeName)
+		log.Printf("[HTTP][PRIORITIZE] scheduled to node=%s duration_ms=%d",
+			nodeName, time.Since(start).Milliseconds())
+		writeJSON(w, scores)
 		return
 	}
 
-	log.Printf(
-		"[HTTP][PRIORITIZE] resolving decision namespace=%s service=%s nodes=%d",
-		namespace,
-		service,
-		len(nodes),
-	)
-
-	decision, err := a.repo.Get(r.Context(), namespace, service)
-	if err != nil {
-		log.Printf("[HTTP][PRIORITIZE][WARN] decision not found, using neutral scores error=%v", err)
-		writeJSON(w, neutral(nodes))
-		return
-	}
-
-	out := scoresFromDecision(nodes, decision)
-
-	log.Printf(
-		"[HTTP][PRIORITIZE] response sent scoredNodes=%d duration_ms=%d",
-		len(out),
-		time.Since(start).Milliseconds(),
-	)
-
-	writeJSON(w, out)
+	// 3. Final Fallback (if no scheduler and no decision)
+	writeJSON(w, neutral(nodes))
 }
 
 func (a *API) ListDecisions(w http.ResponseWriter, r *http.Request) {
@@ -147,12 +169,10 @@ func neutral(nodes []string) []models.HostPriority {
 }
 
 func extractNodeNames(args models.ExtenderArgs) []string {
-	if args.Nodes != nil && len(args.Nodes.Items) > 0 {
-		nodes := make([]string, 0, len(args.Nodes.Items))
-		for _, n := range args.Nodes.Items {
-			nodes = append(nodes, n.Metadata.Name)
-			log.Printf(
-				"[API][DEBUG] node=%s ", n.Metadata.Name)
+	if len(args.Nodes) > 0 {
+		nodes := make([]string, 0, len(args.Nodes))
+		for _, n := range args.Nodes {
+			nodes = append(nodes, n.Name)
 		}
 		return nodes
 	}
@@ -160,6 +180,22 @@ func extractNodeNames(args models.ExtenderArgs) []string {
 		return append([]string{}, (*args.NodeNames)...)
 	}
 	return nil
+}
+
+// generateScoresForNode creates scores with selected node getting 100, others getting lower scores
+func generateScoresForNode(allNodes []string, selectedNode string) []models.HostPriority {
+	out := make([]models.HostPriority, 0, len(allNodes))
+	for _, n := range allNodes {
+		score := 50 // default score
+		if n == selectedNode {
+			score = 100 // selected node gets highest score
+		}
+		out = append(out, models.HostPriority{
+			Host:  n,
+			Score: score,
+		})
+	}
+	return out
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
