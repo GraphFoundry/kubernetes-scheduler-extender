@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-profile
+  labels:
+    app: backend-profile
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend-profile
+  template:
+    metadata:
+      labels:
+        app: backend-profile
+      annotations:
+        sidecar.istio.io/inject: "true"
+    spec:
+      schedulerName: my-scheduler
+      containers:
+        - name: backend-profile
+          image: nginx:alpine
+          ports:
+            - containerPort: 80
+          env:
+            - name: DATABASE_URL
+              value: "postgres://postgres:example@database:5432/postgres"
+        - name: traffic-simulator
+          image: alpine
+          command: ["/bin/sh", "-c"]
+          args:
+            [
+              "apk add --no-cache netcat-openbsd && while true; do nc -z database 5432; sleep 2; done",
+            ]
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-profile
+  labels:
+    app: backend-profile
+spec:
+  ports:
+    - port: 80
+      name: http
+  selector:
+    app: backend-profile
