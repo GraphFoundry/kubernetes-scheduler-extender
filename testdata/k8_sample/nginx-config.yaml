@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-config
+  labels:
+    app: frontend
+data:
+  default.conf: |
+    server {
+        listen       80;
+        server_name  localhost;
+
+        location /feed {
+            proxy_pass http://backend-feed;
+        }
+
+        location /profile {
+            proxy_pass http://backend-profile;
+        }
+        
+        location / {
+            return 200 'OK';
+            add_header Content-Type text/plain;
+        }
+    }

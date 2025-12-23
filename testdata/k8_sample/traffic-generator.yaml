@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traffic-generator
+  labels:
+    app: traffic-generator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: traffic-generator
+  template:
+    metadata:
+      labels:
+        app: traffic-generator
+      annotations:
+        sidecar.istio.io/inject: "true"
+    spec:
+      schedulerName: my-scheduler
+      containers:
+        - name: fast-feed-generator
+          image: curlimages/curl
+          command: ["/bin/sh", "-c"]
+          args: ["while true; do curl -s http://frontend/feed; sleep 0.1; done"]
+        - name: slow-profile-generator
+          image: curlimages/curl
+          command: ["/bin/sh", "-c"]
+          args:
+            ["while true; do curl -s http://frontend/profile; sleep 2; done"]
