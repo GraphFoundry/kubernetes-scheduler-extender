@@ -13,7 +13,7 @@ Follow these steps to deploy the custom scheduler to your local Minikube cluster
 We need to build the image _inside_ Minikube's Docker environment so Kubernetes can find it.
 
 ```bash
-eval $(minikube docker-env)
+# eval $(minikube docker-env) only for single node
 docker build -t my-scheduler:test .
 ```
 
