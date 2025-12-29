@@ -160,6 +160,35 @@ func (a *API) Prioritize(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, neutral(nodes))
 }
 
+// GetOptimalNode returns the best node for a service - simple and direct
+// GET /optimal?namespace=default&service=myservice
+func (a *API) GetOptimalNode(w http.ResponseWriter, r *http.Request) {
+	namespace := r.URL.Query().Get("namespace")
+	if namespace == "" {
+		namespace = "default"
+	}
+
+	service := r.URL.Query().Get("service")
+	if service == "" {
+		http.Error(w, "service parameter required", http.StatusBadRequest)
+		return
+	}
+
+	decision, err := a.repo.Get(r.Context(), namespace, service)
+	if err != nil {
+		writeJSON(w, map[string]any{
+			"node":  "",
+			"found": false,
+		})
+		return
+	}
+
+	writeJSON(w, map[string]any{
+		"node":  decision.BestNode,
+		"found": true,
+	})
+}
+
 func (a *API) ListDecisions(w http.ResponseWriter, r *http.Request) {
 	namespace := r.URL.Query().Get("namespace")
 	if namespace == "" {

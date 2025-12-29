@@ -3,10 +3,11 @@ package httptransport
 import "net/http"
 
 type Handlers struct {
-	Health     http.HandlerFunc
-	Prioritize http.HandlerFunc
-	List       http.HandlerFunc
-	RestartPod http.HandlerFunc
+	Health         http.HandlerFunc
+	Prioritize     http.HandlerFunc
+	List           http.HandlerFunc
+	RestartPod     http.HandlerFunc
+	GetOptimalNode http.HandlerFunc
 }
 
 func NewRouter(h Handlers) http.Handler {
@@ -15,6 +16,7 @@ func NewRouter(h Handlers) http.Handler {
 	mux.HandleFunc("/prioritize", h.Prioritize)
 	mux.HandleFunc("/decisions", h.List)
 	mux.HandleFunc("/restart", h.RestartPod)
+	mux.HandleFunc("/optimal", h.GetOptimalNode)
 
 	return mux
 }

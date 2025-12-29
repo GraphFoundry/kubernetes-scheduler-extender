@@ -82,10 +82,11 @@ func main() {
 	api := httptransport.NewAPI(decisionRepo, sched, cfg.TopKPeers, cfg.TargetServiceID)
 	api.SetClientset(clientset) // ✅ Enable pod restart functionality
 	handlers := httptransport.Handlers{
-		Health:     api.Health,
-		Prioritize: api.Prioritize,
-		List:       api.ListDecisions,
-		RestartPod: api.RestartPod,
+		Health:         api.Health,
+		Prioritize:     api.Prioritize,
+		List:           api.ListDecisions,
+		RestartPod:     api.RestartPod,
+		GetOptimalNode: api.GetOptimalNode,
 	}
 	mux := httptransport.NewRouter(handlers)
 
