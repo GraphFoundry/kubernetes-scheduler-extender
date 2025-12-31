@@ -102,6 +102,20 @@ func (p *K8sPlacementProvider) BuildNodeServiceIndex(ctx context.Context, namesp
 	return index, nil
 }
 
+// GetNodeLabels returns labels for all nodes in the cluster
+func (p *K8sPlacementProvider) GetNodeLabels(ctx context.Context) (map[string]map[string]string, error) {
+	nodes, err := p.clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[string]map[string]string)
+	for _, node := range nodes.Items {
+		result[node.Name] = node.Labels
+	}
+	return result, nil
+}
+
 func serviceNameFromLabels(labels map[string]string) string {
 	// Try common Kubernetes conventions
 	if v := labels["extender.kubernetes.io/name"]; v != "" {

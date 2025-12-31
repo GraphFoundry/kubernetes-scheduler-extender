@@ -67,6 +67,9 @@ func (s *Scorer) ComputeForService(
 		return
 	}
 
+	// 2b. Get node labels for worker detection
+	nodeLabels, _ := s.placement.GetNodeLabels(ctx)
+
 	// 3. No peers = neutral decision
 	if len(peers) == 0 {
 		log.Printf("[SCORER] no peers for service=%s", service)
@@ -74,16 +77,28 @@ func (s *Scorer) ComputeForService(
 		return
 	}
 
-	// 4. Simple scoring: count co-located peers per node
+	// 4. Filter out primary/master nodes if workers exist
+	workerNodes := filterWorkerNodes(nodes, nodeLabels)
+	targetNodes := nodes
+	if len(workerNodes) > 0 {
+		targetNodes = workerNodes
+		log.Printf("[SCORER] filtering to worker nodes only: %v", workerNodes)
+	}
+
+	// 5. Simple scoring: count co-located peers per node + worker bonus
 	scores := make(map[string]int)
 	var maxCount int
 
-	for _, node := range nodes {
+	for _, node := range targetNodes {
 		count := 0
 		for _, p := range peers {
 			if hasService(nodeServiceIndex, node, strings.ToLower(p.Service)) {
 				count++
 			}
+		}
+		// Add 1 worker bonus point for non-primary nodes
+		if isWorkerNode(node, nodeLabels) {
+			count++
 		}
 		scores[node] = count
 		if count > maxCount {
@@ -91,21 +106,30 @@ func (s *Scorer) ComputeForService(
 		}
 	}
 
-	// 5. Normalize scores to 0-100
+	// Set score 0 for primary nodes (excluded from scheduling)
+	for _, node := range nodes {
+		if _, ok := scores[node]; !ok {
+			scores[node] = 0
+		}
+	}
+
+	// 6. Normalize scores to 0-100
 	if maxCount > 0 {
 		for node, count := range scores {
-			scores[node] = int(math.Round(float64(count) / float64(maxCount) * 100))
+			if count > 0 {
+				scores[node] = int(math.Round(float64(count) / float64(maxCount) * 100))
+			}
 		}
 	} else {
-		for _, node := range nodes {
+		for _, node := range targetNodes {
 			scores[node] = 50
 		}
 	}
 
-	// 6. Find best node (deterministic tie-break)
+	// 7. Find best node (deterministic tie-break, only from target nodes)
 	bestNode := ""
 	bestScore := -1
-	for _, node := range nodes {
+	for _, node := range targetNodes {
 		if scores[node] > bestScore || (scores[node] == bestScore && node < bestNode) {
 			bestScore = scores[node]
 			bestNode = node
@@ -158,10 +182,36 @@ func hasService(index map[string]map[string]struct{}, node, service string) bool
 	return ok
 }
 
+// filterWorkerNodes returns only worker nodes (excludes primary/master/control-plane nodes)
+func filterWorkerNodes(nodes []string, nodeLabels map[string]map[string]string) []string {
+	workers := []string{}
+	for _, node := range nodes {
+		if isWorkerNode(node, nodeLabels) {
+			workers = append(workers, node)
+		}
+	}
+	return workers
+}
 
+// isWorkerNode returns true if the node is not a primary/master/control-plane node
+func isWorkerNode(nodeName string, nodeLabels map[string]map[string]string) bool {
+	// Check minikube label first (most reliable)
+	if nodeLabels != nil {
+		if labels, ok := nodeLabels[nodeName]; ok {
+			if primary, ok := labels["minikube.k8s.io/primary"]; ok {
+				return primary == "false"
+			}
+		}
+	}
+	// Fallback to name-based detection
+	nodeLower := strings.ToLower(nodeName)
+	return !strings.Contains(nodeLower, "primary") &&
+		!strings.Contains(nodeLower, "master") &&
+		!strings.Contains(nodeLower, "control-plane")
+}
 
 // writeNeutralDecision writes a neutral decision for fallback scenarios
-// 🔥 SAFE FALLBACK: Used when metrics/scoring fails to let default scheduler decide
+// Still prefers worker nodes over primary nodes
 func (s *Scorer) writeNeutralDecision(
 	ctx context.Context,
 	namespace string,
@@ -169,17 +219,47 @@ func (s *Scorer) writeNeutralDecision(
 	nodes []string,
 	windowSeconds int,
 ) {
+	// Get node labels for worker detection
+	nodeLabels, _ := s.placement.GetNodeLabels(ctx)
+
+	// Get current nodes where service is running
+	nodeServiceIndex, _ := s.placement.BuildNodeServiceIndex(ctx, []string{namespace})
+	currentNodes := getCurrentNodes(nodeServiceIndex, service)
+
+	// Filter to worker nodes if available
+	workerNodes := filterWorkerNodes(nodes, nodeLabels)
+	targetNodes := nodes
+	if len(workerNodes) > 0 {
+		targetNodes = workerNodes
+	}
+
 	scores := make(map[string]int)
+	// Worker nodes get score 50, primary nodes get score 0
 	for _, node := range nodes {
-		scores[node] = 50 // Neutral score - no preference
+		if isWorkerNode(node, nodeLabels) {
+			scores[node] = 50
+		} else {
+			scores[node] = 0
+		}
+	}
+
+	// Pick best worker node (deterministic)
+	bestNode := ""
+	if len(targetNodes) > 0 {
+		bestNode = targetNodes[0]
+		for _, node := range targetNodes {
+			if node < bestNode {
+				bestNode = node
+			}
+		}
 	}
 
 	decision := &models.Decision{
 		Namespace:     namespace,
 		Service:       service,
 		Status:        models.StatusNoMetrics,
-		CurrentNodes:  []string{},
-		BestNode:      "", // No preference - default scheduler decides
+		CurrentNodes:  currentNodes,
+		BestNode:      bestNode,
 		Scores:        scores,
 		EvaluatedAt:   time.Now().UTC(),
 		WindowSeconds: windowSeconds,
