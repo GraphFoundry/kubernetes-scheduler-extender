@@ -11,6 +11,7 @@ docker-build-scheduler: ## Build Docker image for scheduler
 	@echo "Docker image built: $(SCHEDULER_IMAGE):$(IMAGE_TAG)"
 
 run: ## Build Docker images, load to minikube, and restart scheduler
+	# Ensure best-node-selector is reachable for optimal node queries
 	make docker-build-scheduler
 	@if minikube image ls | grep -q "$(SCHEDULER_IMAGE)"; then \
 		kubectl delete deploy my-scheduler -n kube-system --ignore-not-found; \

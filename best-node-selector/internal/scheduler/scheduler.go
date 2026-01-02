@@ -6,6 +6,7 @@ import (
 	"log"
 	"math"
 	"sort"
+	"strings"
 	"time"
 
 	"best-node-selector/internal/models"
@@ -379,10 +380,17 @@ func (s *Scheduler) calculateScore(intent *models.PodIntent, node *models.NodeSt
 	// Taint penalty
 	taintPenalty := float64(len(node.Taints)) * 0.1
 
+	// Worker node bonus (prefer non-primary nodes)
+	workerBonus := 0.0
+	if isWorkerNode(node.Name, node.Labels) {
+		workerBonus = 0.2
+	}
+
 	score := weightCPUFree*cpuFreeRatio +
 		weightMemFree*memFreeRatio -
 		weightFragmentation*fragmentation -
-		weightTaint*taintPenalty
+		weightTaint*taintPenalty +
+		workerBonus
 
 	// Normalize to 0-100
 	return math.Max(0, math.Min(100, score*100))
@@ -715,4 +723,19 @@ func extractServiceName(pod *v1.Pod) string {
 		return appName
 	}
 	return ""
+}
+
+// isWorkerNode returns true if the node is not a primary/master/control-plane node
+func isWorkerNode(nodeName string, labels map[string]string) bool {
+	// Check minikube label first (most reliable)
+	if labels != nil {
+		if primary, ok := labels["minikube.k8s.io/primary"]; ok {
+			return primary == "false"
+		}
+	}
+	// Fallback to name-based detection
+	nodeLower := strings.ToLower(nodeName)
+	return !strings.Contains(nodeLower, "primary") &&
+		!strings.Contains(nodeLower, "master") &&
+		!strings.Contains(nodeLower, "control-plane")
 }

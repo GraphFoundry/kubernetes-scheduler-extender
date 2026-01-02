@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -20,6 +22,11 @@ import (
 const (
 	schedulerName = "my-scheduler"
 )
+
+type OptimalResponse struct {
+	Node  string `json:"node"`
+	Found bool   `json:"found"`
+}
 
 func main() {
 	fmt.Println("Starting custom scheduler...")
@@ -96,9 +103,19 @@ func schedulePod(clientset *kubernetes.Clientset, pod *v1.Pod) error {
 		return fmt.Errorf("no nodes available for scheduling pod %s/%s", freshPod.Namespace, freshPod.Name)
 	}
 
-	// Simple random selection
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	selectedNode := nodes.Items[r.Intn(len(nodes.Items))].Name
+	// Get service name from pod labels
+	serviceName := getServiceName(freshPod)
+
+	// Try to get optimal node from best-node-selector
+	selectedNode := getOptimalNode(freshPod.Namespace, serviceName)
+
+	// Fallback: pick first non-primary node, or only node if single
+	if selectedNode == "" {
+		selectedNode = selectFallbackNode(nodes.Items)
+		log.Printf("Using fallback node selection: %s", selectedNode)
+	} else {
+		log.Printf("Using optimal node from best-node-selector: %s", selectedNode)
+	}
 
 	log.Printf("Selected node %s for pod %s/%s", selectedNode, freshPod.Namespace, freshPod.Name)
 
@@ -121,4 +138,84 @@ func schedulePod(clientset *kubernetes.Clientset, pod *v1.Pod) error {
 	}
 
 	return nil
+}
+
+// getServiceName extracts service name from pod labels
+func getServiceName(pod *v1.Pod) string {
+	if name, ok := pod.Labels["app"]; ok {
+		return name
+	}
+	if name, ok := pod.Labels["app.kubernetes.io/name"]; ok {
+		return name
+	}
+	if name, ok := pod.Labels["service"]; ok {
+		return name
+	}
+	return pod.Name
+}
+
+// getOptimalNode calls best-node-selector to get the optimal node
+func getOptimalNode(namespace, service string) string {
+	baseURL := os.Getenv("BEST_NODE_SELECTOR_URL")
+	if baseURL == "" {
+		baseURL = "http://host.minikube.internal:9000"
+	}
+
+	url := fmt.Sprintf("%s/optimal?namespace=%s&service=%s", baseURL, namespace, service)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		log.Printf("Failed to call best-node-selector: %v", err)
+		return ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("best-node-selector returned status %d", resp.StatusCode)
+		return ""
+	}
+
+	var result OptimalResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		log.Printf("Failed to decode response: %v", err)
+		return ""
+	}
+
+	if result.Found && result.Node != "" {
+		return result.Node
+	}
+
+	return ""
+}
+
+// selectFallbackNode picks the first non-primary node, or the only node if single
+func selectFallbackNode(nodes []v1.Node) string {
+	if len(nodes) == 1 {
+		return nodes[0].Name
+	}
+
+	// Find first non-primary (worker) node
+	for _, node := range nodes {
+		if isWorkerNode(&node) {
+			return node.Name
+		}
+	}
+
+	// All nodes are primary, return first one
+	return nodes[0].Name
+}
+
+// isWorkerNode returns true if the node is not a primary/master/control-plane node
+func isWorkerNode(node *v1.Node) bool {
+	// Check minikube label first
+	if val, ok := node.Labels["minikube.k8s.io/primary"]; ok {
+		return val == "false"
+	}
+
+	// Fallback: check node name
+	name := strings.ToLower(node.Name)
+	return !strings.Contains(name, "primary") &&
+		!strings.Contains(name, "master") &&
+		!strings.Contains(name, "control-plane")
 }
