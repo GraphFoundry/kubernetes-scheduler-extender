@@ -18,6 +18,7 @@ spec:
         extender.kubernetes.io/name: payment
 
     spec:
+      schedulerName: my-scheduler
       containers:
         - name: payment
           image: curlimages/curl

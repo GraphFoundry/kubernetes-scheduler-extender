@@ -5,6 +5,7 @@ metadata:
   labels:
     extender.kubernetes.io/name: test
 spec:
+  schedulerName: my-scheduler
   containers:
     - name: nginx
       image: nginx
