@@ -13,9 +13,10 @@ spec:
       labels:
         app: scheduler-extender
     spec:
+      serviceAccountName: scheduler-extender
       containers:
         - name: extender
-          image: scheduler-extender:latest
+          image: scheduler-extender:dev
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 9000
