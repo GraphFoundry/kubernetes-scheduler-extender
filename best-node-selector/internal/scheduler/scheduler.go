@@ -152,6 +152,28 @@ func (s *Scheduler) Schedule(ctx context.Context, pod *v1.Pod, nodes []v1.Node) 
 	log.Printf("[SCHEDULER] scored %d nodes, top: %s (%.2f)",
 		len(scored), scored[0].Name, scored[0].Score)
 
+	// STEP 4.5: ROUND-ROBIN ROTATION
+	// Rotate the scored nodes list so different pods try different nodes first.
+	service := extractServiceName(pod)
+	if service != "" && len(scored) > 1 {
+		rrCtx, rrCancel := context.WithTimeout(ctx, 100*time.Millisecond)
+		rrIndex, rrErr := s.repo.GetAndIncrementRoundRobin(rrCtx, service)
+		rrCancel()
+		if rrErr == nil {
+			offset := int(rrIndex) % len(scored)
+			if offset > 0 {
+				rotated := make([]*models.ScoredNode, len(scored))
+				copy(rotated, scored[offset:])
+				copy(rotated[len(scored)-offset:], scored[:offset])
+				scored = rotated
+				log.Printf("[SCHEDULER][RR] round-robin offset=%d for service=%s, starting with node=%s",
+					offset, service, scored[0].Name)
+			}
+		} else {
+			log.Printf("[SCHEDULER][RR] round-robin lookup failed: %v, using default order", rrErr)
+		}
+	}
+
 	// STEP 5-8: RESERVE, VALIDATE, BIND (with optimistic locking)
 	nodeName, err = s.reserveAndBind(ctx, intent, scored, nodes)
 	if err != nil {

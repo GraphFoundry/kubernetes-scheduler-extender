@@ -1,13 +1,13 @@
 package app
 
 import (
-	"context"
-	"log"
-	"net/http"
 	"best-node-selector/internal/config"
 	"best-node-selector/internal/models"
 	"best-node-selector/internal/scheduler"
 	httptransport "best-node-selector/internal/transport/http"
+	"context"
+	"log"
+	"net/http"
 	"time"
 )
 
@@ -47,6 +47,7 @@ func (a *App) Run() error {
 
 	router := httptransport.NewRouter(httptransport.Handlers{
 		Health:     api.Health,
+		Metrics:    api.Metrics,
 		Prioritize: api.Prioritize,
 		List:       api.ListDecisions,
 	})
@@ -62,7 +63,7 @@ func (a *App) Run() error {
 	} else {
 		log.Printf("[APP] scheduler-extender listening on :%s (mode=legacy)", a.cfg.Port)
 	}
-	
+
 	return server.ListenAndServe()
 }
 

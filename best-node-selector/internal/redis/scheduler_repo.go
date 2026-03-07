@@ -4,20 +4,22 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	"best-node-selector/internal/models"
 
-	goredis "github.com/redis/go-redis/v9"
 	"github.com/google/uuid"
+	goredis "github.com/redis/go-redis/v9"
 )
 
 const (
-	lockTTL = 500 * time.Millisecond
-	nodeLockKeyPrefix = "lock:node:"
-	podLockKeyPrefix  = "lock:pod:"
-	nodeKeyPrefix     = "node:"
-	podIntentPrefix   = "pod:"
+	lockTTL              = 500 * time.Millisecond
+	nodeLockKeyPrefix    = "lock:node:"
+	podLockKeyPrefix     = "lock:pod:"
+	nodeKeyPrefix        = "node:"
+	podIntentPrefix      = "pod:"
+	roundRobinKeyPrefix  = "rr:"
 )
 
 // Lua script for atomic reservation with version check
@@ -82,9 +84,37 @@ return node.version
 
 // SchedulerRepository handles all Redis operations for scheduler
 type SchedulerRepository struct {
-	rdb             *goredis.Client
-	reserveScript   *goredis.Script
-	rollbackScript  *goredis.Script
+	rdb            *goredis.Client
+	reserveScript  *goredis.Script
+	rollbackScript *goredis.Script
+}
+
+func (r *SchedulerRepository) SetValue(ctx context.Context, key, value string, ttl time.Duration) error {
+	return r.rdb.Set(ctx, key, value, ttl).Err()
+}
+
+func (r *SchedulerRepository) GetValue(ctx context.Context, key string) (string, error) {
+	v, err := r.rdb.Get(ctx, key).Result()
+	if err == goredis.Nil {
+		return "", fmt.Errorf("key not found: %s", key)
+	}
+	return v, err
+}
+
+func (r *SchedulerRepository) SetUnixTime(ctx context.Context, key string, t time.Time, ttl time.Duration) error {
+	return r.SetValue(ctx, key, strconv.FormatInt(t.Unix(), 10), ttl)
+}
+
+func (r *SchedulerRepository) GetUnixTime(ctx context.Context, key string) (time.Time, error) {
+	v, err := r.GetValue(ctx, key)
+	if err != nil {
+		return time.Time{}, err
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.Unix(n, 0), nil
 }
 
 func NewSchedulerRepository(addr string) *SchedulerRepository {
@@ -136,7 +166,7 @@ func (r *SchedulerRepository) SetNodeState(ctx context.Context, state *models.No
 // ListNodeStates retrieves all node states
 func (r *SchedulerRepository) ListNodeStates(ctx context.Context) ([]*models.NodeState, error) {
 	pattern := nodeKeyPrefix + "*"
-	
+
 	var cursor uint64
 	var states []*models.NodeState
 
@@ -189,7 +219,7 @@ func (r *SchedulerRepository) LockNode(ctx context.Context, nodeName string) (st
 // UnlockNode releases a distributed lock
 func (r *SchedulerRepository) UnlockNode(ctx context.Context, nodeName, lockUUID string) error {
 	lockKey := nodeLockKeyPrefix + nodeName
-	
+
 	// Only delete if the UUID matches (prevent unlocking someone else's lock)
 	script := `
 		if redis.call("GET", KEYS[1]) == ARGV[1] then
@@ -198,7 +228,7 @@ func (r *SchedulerRepository) UnlockNode(ctx context.Context, nodeName, lockUUID
 			return 0
 		end
 	`
-	
+
 	return r.rdb.Eval(ctx, script, []string{lockKey}, lockUUID).Err()
 }
 
@@ -210,9 +240,9 @@ func (r *SchedulerRepository) ReserveResources(
 	memBytes int64,
 	expectedVersion int64,
 ) (newVersion int64, err error) {
-	
+
 	nodeKey := nodeKeyPrefix + nodeName
-	
+
 	result, err := r.reserveScript.Run(
 		ctx,
 		r.rdb,
@@ -241,9 +271,9 @@ func (r *SchedulerRepository) RollbackResources(
 	cpuMillis int64,
 	memBytes int64,
 ) (newVersion int64, err error) {
-	
+
 	nodeKey := nodeKeyPrefix + nodeName
-	
+
 	result, err := r.rollbackScript.Run(
 		ctx,
 		r.rdb,
@@ -292,4 +322,18 @@ func (r *SchedulerRepository) GetPodIntent(ctx context.Context, uid string) (*mo
 	}
 
 	return &intent, nil
+}
+
+// GetAndIncrementRoundRobin atomically returns the current counter and increments it.
+// Used to distribute pods across nodes in round-robin fashion.
+func (r *SchedulerRepository) GetAndIncrementRoundRobin(ctx context.Context, service string) (int64, error) {
+	key := roundRobinKeyPrefix + service
+	val, err := r.rdb.Incr(ctx, key).Result()
+	if err != nil {
+		return 0, err
+	}
+	// Set a TTL so stale counters auto-expire
+	r.rdb.Expire(ctx, key, 30*time.Minute)
+	// INCR returns the value *after* increment, so subtract 1 to get the index before increment
+	return val - 1, nil
 }

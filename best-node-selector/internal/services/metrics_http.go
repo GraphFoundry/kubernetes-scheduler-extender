@@ -72,6 +72,19 @@ func (p *HTTPMetricsProvider) GetCentrality(ctx context.Context) (CentralityResp
 	return out, nil
 }
 
+func (p *HTTPMetricsProvider) GetServices(ctx context.Context) (ServicesResponse, error) {
+	log.Printf("[METRICS][HTTP] fetching services catalog")
+
+	var out ServicesResponse
+	if err := p.getJSON(ctx, "/services", &out); err != nil {
+		log.Printf("[METRICS][HTTP][WARN] failed to fetch services error=%v", err)
+		return ServicesResponse{}, err
+	}
+
+	log.Printf("[METRICS][HTTP] services fetched count=%d", len(out.Services))
+	return out, nil
+}
+
 func (p *HTTPMetricsProvider) GetNodePenalty(ctx context.Context, nodeName string) (float64, error) {
 	switch nodeName {
 	case "minikube":

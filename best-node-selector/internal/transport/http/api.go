@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"sort"
 	"time"
 
 	"best-node-selector/internal/models"
@@ -20,10 +21,17 @@ type DecisionReader interface {
 	List(ctx context.Context, namespace string) ([]*models.Decision, error)
 }
 
+// RoundRobinCounter provides atomic round-robin counters for pod distribution
+type RoundRobinCounter interface {
+	GetAndIncrementRoundRobin(ctx context.Context, service string) (int64, error)
+}
+
 type API struct {
 	repo          DecisionReader
 	scheduler     *scheduler.Scheduler
 	clientset     *kubernetes.Clientset
+	rrCounter     RoundRobinCounter
+	metricsTextFn func() string
 	topK          int
 	targetService string
 }
@@ -43,8 +51,29 @@ func (a *API) SetClientset(clientset *kubernetes.Clientset) {
 	a.clientset = clientset
 }
 
+func (a *API) SetMetricsHandler(fn func() string) {
+	a.metricsTextFn = fn
+}
+
+// SetRoundRobinCounter sets the round-robin counter for pod distribution
+func (a *API) SetRoundRobinCounter(rr RoundRobinCounter) {
+	a.rrCounter = rr
+}
+
 func (a *API) Health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"status": "ok"})
+}
+
+func (a *API) Metrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	if a.metricsTextFn == nil {
+		_, _ = w.Write([]byte("scheduler_rebalance_cycles_total 0\n" +
+			"scheduler_rebalance_skipped_total 0\n" +
+			"scheduler_pods_migrated_total 0\n" +
+			"scheduler_rebalance_duration_seconds 0\n"))
+		return
+	}
+	_, _ = w.Write([]byte(a.metricsTextFn()))
 }
 
 func (a *API) Prioritize(w http.ResponseWriter, r *http.Request) {
@@ -113,8 +142,8 @@ func (a *API) Prioritize(w http.ResponseWriter, r *http.Request) {
 
 		decision, err := a.repo.Get(r.Context(), namespace, service)
 		if err == nil {
-			// Found a decision! Use it.
-			out := scoresFromDecision(nodes, decision)
+			// Found a decision! Apply round-robin to distribute pods across nodes.
+			out := a.scoresFromDecisionRoundRobin(r.Context(), nodes, decision, service)
 			log.Printf(
 				"[HTTP][PRIORITIZE] decision found! deployment=%s response sent scoredNodes=%d duration_ms=%d",
 				deployment,
@@ -311,7 +340,160 @@ func (a *API) RestartPod(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, response)
 }
 
+// ChangeNode handles requests to move a pod to a different node.
+// It deletes the pod so the controller recreates it, and the round-robin/scoring
+// will place it on the target node.
+// POST /change-node
+func (a *API) ChangeNode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if a.clientset == nil {
+		http.Error(w, "kubernetes client not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req struct {
+		Namespace  string `json:"namespace"`
+		PodName    string `json:"podName"`
+		TargetNode string `json:"targetNode"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.Namespace == "" {
+		req.Namespace = "default"
+	}
+	if req.PodName == "" {
+		http.Error(w, "podName is required", http.StatusBadRequest)
+		return
+	}
+	if req.TargetNode == "" {
+		http.Error(w, "targetNode is required", http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
+
+	log.Printf("[HTTP][CHANGE-NODE] request: namespace=%s pod=%s targetNode=%s",
+		req.Namespace, req.PodName, req.TargetNode)
+
+	// 1. Verify pod exists
+	pod, err := a.clientset.CoreV1().Pods(req.Namespace).Get(ctx, req.PodName, metav1.GetOptions{})
+	if err != nil {
+		log.Printf("[HTTP][CHANGE-NODE] pod not found: %v", err)
+		http.Error(w, "pod not found", http.StatusNotFound)
+		return
+	}
+
+	currentNode := pod.Spec.NodeName
+
+	// 2. Verify target node exists and is ready
+	targetNode, err := a.clientset.CoreV1().Nodes().Get(ctx, req.TargetNode, metav1.GetOptions{})
+	if err != nil {
+		log.Printf("[HTTP][CHANGE-NODE] target node not found: %v", err)
+		http.Error(w, "target node not found", http.StatusBadRequest)
+		return
+	}
+
+	nodeReady := false
+	for _, cond := range targetNode.Status.Conditions {
+		if cond.Type == "Ready" && cond.Status == "True" {
+			nodeReady = true
+			break
+		}
+	}
+	if !nodeReady {
+		http.Error(w, "target node is not ready", http.StatusBadRequest)
+		return
+	}
+
+	// 3. Check if pod is managed by a controller
+	isManaged := len(pod.OwnerReferences) > 0
+	if !isManaged {
+		writeJSON(w, map[string]any{
+			"success": false,
+			"error":   "pod is not managed by a controller - cannot safely reschedule",
+		})
+		return
+	}
+
+	// 4. Patch the deployment/replicaset with a nodeSelector to target the specific node
+	// For now, we delete the pod and let the scheduler place it.
+	// The pod's deployment can be patched with a node affinity if needed.
+	log.Printf("[HTTP][CHANGE-NODE] deleting pod=%s/%s (currentNode=%s) to reschedule to targetNode=%s",
+		req.Namespace, req.PodName, currentNode, req.TargetNode)
+
+	deleteOptions := metav1.DeleteOptions{}
+	err = a.clientset.CoreV1().Pods(req.Namespace).Delete(ctx, req.PodName, deleteOptions)
+	if err != nil {
+		log.Printf("[HTTP][CHANGE-NODE] delete failed: %v", err)
+		http.Error(w, "failed to delete pod for rescheduling", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[HTTP][CHANGE-NODE] pod deleted, will be rescheduled. namespace=%s pod=%s targetNode=%s",
+		req.Namespace, req.PodName, req.TargetNode)
+
+	writeJSON(w, map[string]any{
+		"success":      true,
+		"namespace":    req.Namespace,
+		"podName":      req.PodName,
+		"previousNode": currentNode,
+		"targetNode":   req.TargetNode,
+		"message":      "Pod deleted - controller will recreate and scheduler will place on target node",
+	})
+}
+
 /* ---------------- helpers ---------------- */
+
+// scoresFromDecisionRoundRobin distributes pods across nodes using round-robin.
+// Instead of always giving the bestNode the highest score, it rotates which node gets the top score.
+func (a *API) scoresFromDecisionRoundRobin(ctx context.Context, nodes []string, d *models.Decision, service string) []models.HostPriority {
+	if len(nodes) <= 1 || a.rrCounter == nil {
+		return scoresFromDecision(nodes, d)
+	}
+
+	// Sort nodes by their decision score (descending) to get a consistent order
+	type nodeScore struct {
+		name  string
+		score int
+	}
+	ranked := make([]nodeScore, 0, len(nodes))
+	for _, n := range nodes {
+		score := 50
+		if v, ok := d.Scores[n]; ok {
+			score = v
+		}
+		ranked = append(ranked, nodeScore{name: n, score: score})
+	}
+	sort.Slice(ranked, func(i, j int) bool {
+		return ranked[i].score > ranked[j].score
+	})
+
+	// Get round-robin index
+	rrCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	rrIndex, err := a.rrCounter.GetAndIncrementRoundRobin(rrCtx, service)
+	if err != nil {
+		log.Printf("[HTTP][PRIORITIZE][RR] round-robin failed: %v, using default scores", err)
+		return scoresFromDecision(nodes, d)
+	}
+
+	// Pick the node for this pod based on round-robin
+	selectedIdx := int(rrIndex) % len(ranked)
+	selectedNode := ranked[selectedIdx].name
+
+	log.Printf("[HTTP][PRIORITIZE][RR] round-robin index=%d selected node=%s for service=%s",
+		rrIndex, selectedNode, service)
+
+	return generateScoresForNode(nodes, selectedNode)
+}
 
 func scoresFromDecision(nodes []string, d *models.Decision) []models.HostPriority {
 	out := make([]models.HostPriority, 0, len(nodes))

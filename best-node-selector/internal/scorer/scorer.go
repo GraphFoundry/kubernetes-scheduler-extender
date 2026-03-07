@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -11,10 +12,26 @@ import (
 	"best-node-selector/internal/services"
 )
 
+const (
+	defaultTopKPeers     = 3
+	targetUtilization    = 0.65
+	utilizationBand      = 0.35
+	cpuHardCap           = 0.85
+	memHardCap           = 0.85
+	neutralNormFallback  = 0.5
+	localityWeight       = 0.4
+	spreadWeight         = 0.2
+	utilBaseWeight       = 0.3
+	utilCriticalitySlope = 0.2
+	riskBaseWeight       = 0.1
+	riskCriticalitySlope = 0.2
+)
+
 type Scorer struct {
 	metrics   services.MetricsProvider
 	placement services.PlacementProvider
 	repo      DecisionWriter
+	topKPeers int
 }
 
 type DecisionWriter interface {
@@ -25,11 +42,16 @@ func New(
 	metrics services.MetricsProvider,
 	placement services.PlacementProvider,
 	repo DecisionWriter,
+	topKPeers int,
 ) *Scorer {
+	if topKPeers <= 0 {
+		topKPeers = defaultTopKPeers
+	}
 	return &Scorer{
 		metrics:   metrics,
 		placement: placement,
 		repo:      repo,
+		topKPeers: topKPeers,
 	}
 }
 
@@ -50,32 +72,47 @@ func (s *Scorer) ComputeForService(
 		}
 	}()
 
-	// 1. Get peers (services this service communicates with)
-	outPeers, err := s.metrics.GetPeers(ctx, service, "out", 1)
+	// 1. Fetch graph data
+	centrality, err := s.metrics.GetCentrality(ctx)
+	degradedMode := false
+	if err != nil {
+		log.Printf("[SCORER][WARN] centrality fetch failed service=%s: %v", service, err)
+		degradedMode = true
+		centrality = services.CentralityResponse{}
+	}
+	servicesSnapshot, err := s.metrics.GetServices(ctx)
+	if err != nil {
+		log.Printf("[SCORER][WARN] services catalog fetch failed service=%s: %v", service, err)
+		degradedMode = true
+		servicesSnapshot = services.ServicesResponse{}
+	}
+
+	// 2. Get top peers from traffic
+	outPeers, err := s.metrics.GetPeers(ctx, service, "out", 50)
 	if err != nil {
 		log.Printf("[SCORER][WARN] peers failed service=%s: %v", service, err)
-		s.writeNeutralDecision(ctx, namespace, service, nodes, windowSeconds)
-		return
+		degradedMode = true
+		outPeers = services.PeersResponse{}
 	}
-	inPeers, _ := s.metrics.GetPeers(ctx, service, "in", 1)
-	peers := append(outPeers.Peers, inPeers.Peers...)
-
-	// 2. Get placement index (which services run on which nodes)
-	nodeServiceIndex, err := s.placement.BuildNodeServiceIndex(ctx, []string{namespace})
+	inPeers, err := s.metrics.GetPeers(ctx, service, "in", 50)
 	if err != nil {
+		log.Printf("[SCORER][WARN] inbound peers failed service=%s: %v", service, err)
+		degradedMode = true
+		inPeers = services.PeersResponse{}
+	}
+	peerWeights := aggregatePeerTraffic(outPeers.Peers, inPeers.Peers)
+	topPeers := topKPeerWeights(peerWeights, s.topKPeers)
+
+	// 3. Get runtime placement data
+	nodeRuntime, err := s.placement.GetNodeRuntime(ctx, []string{namespace})
+	if err != nil {
+		log.Printf("[SCORER][WARN] runtime fetch failed service=%s: %v", service, err)
 		s.writeNeutralDecision(ctx, namespace, service, nodes, windowSeconds)
 		return
 	}
 
-	// 2b. Get node labels for worker detection
+	// 3b. Get node labels for worker detection
 	nodeLabels, _ := s.placement.GetNodeLabels(ctx)
-
-	// 3. No peers = neutral decision
-	if len(peers) == 0 {
-		log.Printf("[SCORER] no peers for service=%s", service)
-		s.writeNeutralDecision(ctx, namespace, service, nodes, windowSeconds)
-		return
-	}
 
 	// 4. Filter out primary/master nodes if workers exist
 	workerNodes := filterWorkerNodes(nodes, nodeLabels)
@@ -85,58 +122,104 @@ func (s *Scorer) ComputeForService(
 		log.Printf("[SCORER] filtering to worker nodes only: %v", workerNodes)
 	}
 
-	// 5. Simple scoring: count co-located peers per node + worker bonus
-	scores := make(map[string]int)
-	var maxCount int
+	criticalityByService, criticality := computeCriticality(service, centrality, servicesSnapshot)
+	podReqCPU, podReqMem := estimateIncomingRequest(service, nodeRuntime)
 
+	feasibleNodes := make([]string, 0, len(targetNodes))
+	projectedCPU := map[string]float64{}
+	projectedMem := map[string]float64{}
 	for _, node := range targetNodes {
-		count := 0
-		for _, p := range peers {
-			if hasService(nodeServiceIndex, node, strings.ToLower(p.Service)) {
-				count++
-			}
+		rt, ok := nodeRuntime[node]
+		if !ok || !rt.Ready || !rt.Schedulable || rt.AllocCPUMilli <= 0 || rt.AllocMemBytes <= 0 {
+			continue
 		}
-		// Add 1 worker bonus point for non-primary nodes
-		if isWorkerNode(node, nodeLabels) {
-			count++
+
+		projCPU := float64(rt.UsedCPUMilli+podReqCPU) / float64(rt.AllocCPUMilli)
+		projMem := float64(rt.UsedMemBytes+podReqMem) / float64(rt.AllocMemBytes)
+		if projCPU > cpuHardCap || projMem > memHardCap {
+			continue
 		}
-		scores[node] = count
-		if count > maxCount {
-			maxCount = count
+		projectedCPU[node] = projCPU
+		projectedMem[node] = projMem
+		feasibleNodes = append(feasibleNodes, node)
+	}
+
+	if len(feasibleNodes) == 0 {
+		log.Printf("[SCORER][WARN] no feasible nodes for service=%s", service)
+		s.writeNeutralDecision(ctx, namespace, service, nodes, windowSeconds)
+		return
+	}
+
+	localityRaw := make(map[string]float64, len(feasibleNodes))
+	utilScore := make(map[string]float64, len(feasibleNodes))
+	spreadScore := make(map[string]float64, len(feasibleNodes))
+	nodeCriticalMass := make(map[string]float64, len(feasibleNodes))
+
+	for _, node := range feasibleNodes {
+		rt := nodeRuntime[node]
+
+		var lRaw float64
+		for _, peer := range topPeers {
+			peerPods := rt.PodsByService[peer.Service]
+			lRaw += peer.Weight * math.Log1p(float64(peerPods))
+		}
+		localityRaw[node] = lRaw
+
+		cpuScore := math.Max(0, 1-math.Abs(projectedCPU[node]-targetUtilization)/utilizationBand)
+		memScore := math.Max(0, 1-math.Abs(projectedMem[node]-targetUtilization)/utilizationBand)
+		utilScore[node] = (cpuScore + memScore) / 2.0
+
+		podsSOnN := rt.PodsByService[strings.ToLower(service)]
+		switch {
+		case podsSOnN == 0:
+			spreadScore[node] = 1.0
+		case podsSOnN == 1:
+			spreadScore[node] = 0.6
+		default:
+			spreadScore[node] = 0.2
+		}
+
+		for svc := range rt.Services {
+			nodeCriticalMass[node] += criticalityByService[svc]
 		}
 	}
 
-	// Set score 0 for primary nodes (excluded from scheduling)
+	localityScore := normalizeMapValues(localityRaw, feasibleNodes)
+	nodeCriticalNorm := normalizeMapValues(nodeCriticalMass, feasibleNodes)
+
+	utilWeight := utilBaseWeight - utilCriticalitySlope*criticality
+	riskWeight := riskBaseWeight + riskCriticalitySlope*criticality
+
+	rawScores := make(map[string]float64, len(feasibleNodes))
+	for _, node := range feasibleNodes {
+		riskPenalty := nodeCriticalNorm[node] * criticality
+		rawScores[node] =
+			localityWeight*localityScore[node] +
+				utilWeight*utilScore[node] +
+				spreadWeight*spreadScore[node] -
+				riskWeight*riskPenalty
+	}
+
+	normalized := normalizeMapValues(rawScores, feasibleNodes)
+	scores := make(map[string]int, len(nodes))
 	for _, node := range nodes {
-		if _, ok := scores[node]; !ok {
-			scores[node] = 0
-		}
+		scores[node] = 0
+	}
+	for _, node := range feasibleNodes {
+		scores[node] = int(math.Round(normalized[node] * 100))
 	}
 
-	// 6. Normalize scores to 0-100
-	if maxCount > 0 {
-		for node, count := range scores {
-			if count > 0 {
-				scores[node] = int(math.Round(float64(count) / float64(maxCount) * 100))
-			}
-		}
-	} else {
-		for _, node := range targetNodes {
-			scores[node] = 50
-		}
-	}
-
-	// 7. Find best node (deterministic tie-break, only from target nodes)
+	// 7. Find best node (deterministic tie-break, only from feasible nodes)
 	bestNode := ""
 	bestScore := -1
-	for _, node := range targetNodes {
+	for _, node := range feasibleNodes {
 		if scores[node] > bestScore || (scores[node] == bestScore && node < bestNode) {
 			bestScore = scores[node]
 			bestNode = node
 		}
 	}
 
-	currentNodes := getCurrentNodes(nodeServiceIndex, service)
+	currentNodes := getCurrentNodesFromRuntime(nodeRuntime, service)
 
 	decision := &models.Decision{
 		Namespace:     namespace,
@@ -155,31 +238,200 @@ func (s *Scorer) ComputeForService(
 	}
 
 	log.Printf("[SCORER] done service=%s best=%s peers=%d duration=%dms",
-		service, bestNode, len(peers), time.Since(start).Milliseconds())
+		service, bestNode, len(topPeers), time.Since(start).Milliseconds())
+	if degradedMode {
+		log.Printf("[SCORER][WARN] degraded_mode=true service=%s", service)
+	}
 }
 
 /* ================= helpers (unchanged math) ================= */
 
-func getCurrentNodes(
-	index map[string]map[string]struct{},
-	service string,
-) []string {
-	nodes := []string{}
-	for node, svcs := range index {
-		if _, ok := svcs[strings.ToLower(service)]; ok {
+type peerWeight struct {
+	Service string
+	Weight  float64
+}
+
+func aggregatePeerTraffic(out []services.Peer, in []services.Peer) map[string]float64 {
+	agg := map[string]float64{}
+	for _, p := range out {
+		agg[strings.ToLower(p.Service)] += p.Metrics.Rate
+	}
+	for _, p := range in {
+		agg[strings.ToLower(p.Service)] += p.Metrics.Rate
+	}
+	return agg
+}
+
+func topKPeerWeights(agg map[string]float64, k int) []peerWeight {
+	if k <= 0 || len(agg) == 0 {
+		return nil
+	}
+
+	vals := make([]float64, 0, len(agg))
+	for _, v := range agg {
+		vals = append(vals, v)
+	}
+	p05, p95 := percentileBand(vals, 0.05, 0.95)
+
+	peers := make([]peerWeight, 0, len(agg))
+	for svc, v := range agg {
+		peers = append(peers, peerWeight{Service: svc, Weight: norm(v, p05, p95)})
+	}
+
+	sort.Slice(peers, func(i, j int) bool {
+		if peers[i].Weight == peers[j].Weight {
+			return peers[i].Service < peers[j].Service
+		}
+		return peers[i].Weight > peers[j].Weight
+	})
+
+	if len(peers) > k {
+		peers = peers[:k]
+	}
+	return peers
+}
+
+func computeCriticality(service string, c services.CentralityResponse, svcSnapshot services.ServicesResponse) (map[string]float64, float64) {
+	prVals := make([]float64, 0, len(c.Scores))
+	bcVals := make([]float64, 0, len(c.Scores))
+	availabilityByService := map[string]float64{}
+	availVals := make([]float64, 0, len(svcSnapshot.Services))
+	for _, svc := range svcSnapshot.Services {
+		key := strings.ToLower(svc.Name)
+		avail := 0.0
+		if svc.Availability > 0 {
+			avail = 1.0
+		}
+		availabilityByService[key] = avail
+		availVals = append(availVals, avail)
+	}
+
+	for _, score := range c.Scores {
+		prVals = append(prVals, score.Pagerank)
+		bcVals = append(bcVals, score.Betweenness)
+		if score.Availability != nil {
+			availabilityByService[strings.ToLower(score.Service)] = *score.Availability
+			availVals = append(availVals, *score.Availability)
+		}
+	}
+	pr05, pr95 := percentileBand(prVals, 0.05, 0.95)
+	bc05, bc95 := percentileBand(bcVals, 0.05, 0.95)
+	avail05, avail95 := percentileBand(availVals, 0.05, 0.95)
+
+	byService := make(map[string]float64, len(c.Scores))
+	for _, score := range c.Scores {
+		prN := norm(score.Pagerank, pr05, pr95)
+		bcN := norm(score.Betweenness, bc05, bc95)
+		availN := neutralNormFallback
+		if avail, ok := availabilityByService[strings.ToLower(score.Service)]; ok {
+			availN = norm(avail, avail05, avail95)
+		}
+		crit := 0.4*prN + 0.4*bcN + 0.2*(1-availN)
+		byService[strings.ToLower(score.Service)] = crit
+	}
+
+	target := byService[strings.ToLower(service)]
+	if target == 0 {
+		target = neutralNormFallback
+	}
+	return byService, target
+}
+
+func estimateIncomingRequest(service string, runtime map[string]services.NodeRuntime) (int64, int64) {
+	svcKey := strings.ToLower(service)
+	var cpuSamples []int64
+	var memSamples []int64
+	for _, node := range runtime {
+		for _, req := range node.ServiceResources[svcKey] {
+			cpuSamples = append(cpuSamples, req.CPUMilli)
+			memSamples = append(memSamples, req.MemBytes)
+		}
+	}
+	if len(cpuSamples) == 0 || len(memSamples) == 0 {
+		return 100, 128 * 1024 * 1024
+	}
+	return medianInt64(cpuSamples), medianInt64(memSamples)
+}
+
+func getCurrentNodesFromRuntime(runtime map[string]services.NodeRuntime, service string) []string {
+	var nodes []string
+	svc := strings.ToLower(service)
+	for node, st := range runtime {
+		if st.PodsByService[svc] > 0 {
 			nodes = append(nodes, node)
 		}
 	}
+	sort.Strings(nodes)
 	return nodes
 }
 
-func hasService(index map[string]map[string]struct{}, node, service string) bool {
-	set, ok := index[node]
-	if !ok {
-		return false
+func normalizeMapValues(input map[string]float64, nodes []string) map[string]float64 {
+	vals := make([]float64, 0, len(nodes))
+	for _, node := range nodes {
+		vals = append(vals, input[node])
 	}
-	_, ok = set[service]
-	return ok
+	p05, p95 := percentileBand(vals, 0.05, 0.95)
+	out := make(map[string]float64, len(nodes))
+	for _, node := range nodes {
+		out[node] = norm(input[node], p05, p95)
+	}
+	return out
+}
+
+func percentileBand(vals []float64, low, high float64) (float64, float64) {
+	if len(vals) == 0 {
+		return 0, 1
+	}
+	sorted := append([]float64(nil), vals...)
+	sort.Float64s(sorted)
+	return percentile(sorted, low), percentile(sorted, high)
+}
+
+func percentile(sorted []float64, q float64) float64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	if q <= 0 {
+		return sorted[0]
+	}
+	if q >= 1 {
+		return sorted[len(sorted)-1]
+	}
+	pos := q * float64(len(sorted)-1)
+	low := int(math.Floor(pos))
+	high := int(math.Ceil(pos))
+	if low == high {
+		return sorted[low]
+	}
+	frac := pos - float64(low)
+	return sorted[low] + frac*(sorted[high]-sorted[low])
+}
+
+func norm(x, p05, p95 float64) float64 {
+	if p95 == p05 {
+		return neutralNormFallback
+	}
+	v := (x - p05) / (p95 - p05)
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
+
+func medianInt64(vals []int64) int64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	sorted := append([]int64(nil), vals...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	mid := len(sorted) / 2
+	if len(sorted)%2 == 1 {
+		return sorted[mid]
+	}
+	return (sorted[mid-1] + sorted[mid]) / 2
 }
 
 // filterWorkerNodes returns only worker nodes (excludes primary/master/control-plane nodes)
@@ -223,8 +475,8 @@ func (s *Scorer) writeNeutralDecision(
 	nodeLabels, _ := s.placement.GetNodeLabels(ctx)
 
 	// Get current nodes where service is running
-	nodeServiceIndex, _ := s.placement.BuildNodeServiceIndex(ctx, []string{namespace})
-	currentNodes := getCurrentNodes(nodeServiceIndex, service)
+	nodeRuntime, _ := s.placement.GetNodeRuntime(ctx, []string{namespace})
+	currentNodes := getCurrentNodesFromRuntime(nodeRuntime, service)
 
 	// Filter to worker nodes if available
 	workerNodes := filterWorkerNodes(nodes, nodeLabels)

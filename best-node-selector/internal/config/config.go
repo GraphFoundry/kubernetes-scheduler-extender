@@ -41,6 +41,16 @@ type Config struct {
 
 	// Scorer interval (how often to recompute scores)
 	ScorerInterval time.Duration
+
+	// Rebalancing controls
+	RebalancingEnabled        bool
+	RebalanceInterval         time.Duration
+	RebalanceCooldown         time.Duration
+	RebalanceLatencyThreshold float64
+	MaxPodsMovedPerCycle      int
+	MaxRebalanceDuration      time.Duration
+	MinPodAgeForRebalance     time.Duration
+	PodMoveAntiThrashWindow   time.Duration
 }
 
 func Load() (Config, error) {
@@ -56,6 +66,15 @@ func Load() (Config, error) {
 		RedisAddr:         getEnv("REDIS_ADDR", "localhost:6379"),
 		EnableScoreUpdate: getBool("ENABLE_SCORE_UPDATE", true),
 		ScorerInterval:    getDurationSec("SCORER_INTERVAL_SEC", 10),
+
+		RebalancingEnabled:        getBool("REBALANCING_ENABLED", true),
+		RebalanceInterval:         getDurationSec("REBALANCE_INTERVAL_SECONDS", 300),
+		RebalanceCooldown:         getDurationSec("REBALANCE_COOLDOWN_SECONDS", 1800),
+		RebalanceLatencyThreshold: getFloat64("LATENCY_THRESHOLD_MS", 40),
+		MaxPodsMovedPerCycle:      getInt("MAX_PODS_MOVED_PER_CYCLE", 3),
+		MaxRebalanceDuration:      getDurationSec("MAX_REBALANCE_DURATION_SECONDS", 30),
+		MinPodAgeForRebalance:     getDurationSec("MIN_POD_AGE_FOR_REBALANCE_SECONDS", 600),
+		PodMoveAntiThrashWindow:   getDurationSec("POD_REBALANCE_ANTITHRASH_SECONDS", 3600),
 	}
 
 	if cfg.MetricsProvider != ProviderSample && cfg.MetricsProvider != ProviderHTTP {
@@ -63,6 +82,18 @@ func Load() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func getFloat64(key string, def float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return def
+	}
+	return n
 }
 
 func getEnv(key, def string) string {

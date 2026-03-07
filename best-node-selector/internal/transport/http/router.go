@@ -4,10 +4,12 @@ import "net/http"
 
 type Handlers struct {
 	Health         http.HandlerFunc
+	Metrics        http.HandlerFunc
 	Prioritize     http.HandlerFunc
 	List           http.HandlerFunc
 	RestartPod     http.HandlerFunc
 	GetOptimalNode http.HandlerFunc
+	ChangeNode     http.HandlerFunc
 }
 
 func corsMiddleware(next http.Handler) http.Handler {
@@ -35,10 +37,12 @@ func corsMiddleware(next http.Handler) http.Handler {
 func NewRouter(h Handlers) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", h.Health)
+	mux.HandleFunc("/metrics", h.Metrics)
 	mux.HandleFunc("/prioritize", h.Prioritize)
 	mux.HandleFunc("/decisions", h.List)
 	mux.HandleFunc("/restart", h.RestartPod)
 	mux.HandleFunc("/optimal", h.GetOptimalNode)
+	mux.HandleFunc("/change-node", h.ChangeNode)
 
 	return corsMiddleware(mux)
 }

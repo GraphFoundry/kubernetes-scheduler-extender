@@ -33,9 +33,10 @@ type PeersResponse struct {
 
 // /centrality
 type CentralityScore struct {
-	Service     string  `json:"service"`
-	Pagerank    float64 `json:"pagerank"`
-	Betweenness float64 `json:"betweenness"`
+	Service      string   `json:"service"`
+	Pagerank     float64  `json:"pagerank"`
+	Betweenness  float64  `json:"betweenness"`
+	Availability *float64 `json:"availability,omitempty"`
 }
 
 type CentralityResponse struct {
@@ -43,8 +44,21 @@ type CentralityResponse struct {
 	Scores        []CentralityScore `json:"scores"`
 }
 
+// /services
+type ServiceEntry struct {
+	Name         string `json:"name"`
+	Namespace    string `json:"namespace"`
+	PodCount     int    `json:"podCount"`
+	Availability int    `json:"availability"`
+}
+
+type ServicesResponse struct {
+	Services []ServiceEntry `json:"services"`
+}
+
 type MetricsProvider interface {
 	GetHealth(ctx context.Context) (GraphHealth, error)
 	GetPeers(ctx context.Context, serviceName string, direction string, limit int) (PeersResponse, error)
 	GetCentrality(ctx context.Context) (CentralityResponse, error)
+	GetServices(ctx context.Context) (ServicesResponse, error)
 }
