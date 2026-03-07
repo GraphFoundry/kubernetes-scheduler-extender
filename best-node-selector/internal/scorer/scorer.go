@@ -28,14 +28,20 @@ const (
 )
 
 type Scorer struct {
-	metrics   services.MetricsProvider
-	placement services.PlacementProvider
-	repo      DecisionWriter
-	topKPeers int
+	metrics    services.MetricsProvider
+	placement  services.PlacementProvider
+	repo       DecisionWriter
+	topKPeers  int
+	prefReader PreferenceReader
 }
 
 type DecisionWriter interface {
 	Save(ctx context.Context, d *models.Decision) error
+}
+
+// PreferenceReader reads user node preferences from Redis
+type PreferenceReader interface {
+	GetNodePreference(ctx context.Context, namespace, service string) (string, error)
 }
 
 func New(
@@ -53,6 +59,11 @@ func New(
 		repo:      repo,
 		topKPeers: topKPeers,
 	}
+}
+
+// SetPreferenceReader sets the preference reader for looking up user preferences
+func (s *Scorer) SetPreferenceReader(pr PreferenceReader) {
+	s.prefReader = pr
 }
 
 func (s *Scorer) ComputeForService(
@@ -230,6 +241,20 @@ func (s *Scorer) ComputeForService(
 		Scores:        scores,
 		EvaluatedAt:   time.Now().UTC(),
 		WindowSeconds: windowSeconds,
+	}
+
+	// Apply user preference: if a preference exists and the node is feasible, override BestNode
+	if s.prefReader != nil {
+		prefNode, prefErr := s.prefReader.GetNodePreference(ctx, namespace, service)
+		if prefErr == nil && prefNode != "" {
+			decision.PreferredNode = prefNode
+			if _, ok := scores[prefNode]; ok && scores[prefNode] > 0 {
+				decision.BestNode = prefNode
+				log.Printf("[SCORER] user preference applied: bestNode overridden to %s for service=%s", prefNode, service)
+			} else {
+				log.Printf("[SCORER] user preference node=%s not feasible for service=%s, keeping bestNode=%s", prefNode, service, bestNode)
+			}
+		}
 	}
 
 	if err := s.repo.Save(ctx, decision); err != nil {
@@ -447,11 +472,18 @@ func filterWorkerNodes(nodes []string, nodeLabels map[string]map[string]string) 
 
 // isWorkerNode returns true if the node is not a primary/master/control-plane node
 func isWorkerNode(nodeName string, nodeLabels map[string]map[string]string) bool {
-	// Check minikube label first (most reliable)
 	if nodeLabels != nil {
 		if labels, ok := nodeLabels[nodeName]; ok {
+			// Check minikube label
 			if primary, ok := labels["minikube.k8s.io/primary"]; ok {
 				return primary == "false"
+			}
+			// Check standard kubeadm control-plane / master labels
+			if _, ok := labels["node-role.kubernetes.io/control-plane"]; ok {
+				return false
+			}
+			if _, ok := labels["node-role.kubernetes.io/master"]; ok {
+				return false
 			}
 		}
 	}
@@ -459,7 +491,31 @@ func isWorkerNode(nodeName string, nodeLabels map[string]map[string]string) bool
 	nodeLower := strings.ToLower(nodeName)
 	return !strings.Contains(nodeLower, "primary") &&
 		!strings.Contains(nodeLower, "master") &&
-		!strings.Contains(nodeLower, "control-plane")
+		!strings.Contains(nodeLower, "control-plane") &&
+		!strings.HasSuffix(nodeLower, "-cp") &&
+		!strings.Contains(nodeLower, "-cp-") &&
+		!matchControlPlanePattern(nodeLower)
+}
+
+// matchControlPlanePattern checks for patterns like k8s-cp1, node-cp2 etc.
+func matchControlPlanePattern(nodeLower string) bool {
+	// Match patterns like "cp1", "cp2" at end of name segments
+	parts := strings.Split(nodeLower, "-")
+	for _, part := range parts {
+		if len(part) >= 2 && strings.HasPrefix(part, "cp") {
+			isDigitSuffix := true
+			for _, ch := range part[2:] {
+				if ch < '0' || ch > '9' {
+					isDigitSuffix = false
+					break
+				}
+			}
+			if isDigitSuffix {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // writeNeutralDecision writes a neutral decision for fallback scenarios

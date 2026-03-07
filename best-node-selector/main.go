@@ -61,6 +61,7 @@ func main() {
 
 	// ✅ Initialize scorer with decision repository
 	scorerInstance := scorer.New(metricsProvider, placementProvider, decisionRepo, cfg.TopKPeers)
+	scorerInstance.SetPreferenceReader(repo) // ✅ Enable user preference lookups during scoring
 	rebalancerController := rebalancer.New(cfg, repo, metricsProvider, clientset)
 
 	log.Println("🚀 Production-grade scheduler initialized")
@@ -92,6 +93,8 @@ func main() {
 	api.SetClientset(clientset) // ✅ Enable pod restart functionality
 	api.SetMetricsHandler(rebalancerController.MetricsText)
 	api.SetRoundRobinCounter(repo) // ✅ Enable round-robin pod distribution
+	api.SetPreferenceStore(repo)   // ✅ Enable user node preferences
+	api.SetOverrideStore(repo)     // ✅ Enable change-node overrides
 	handlers := httptransport.Handlers{
 		Health:         api.Health,
 		Metrics:        api.Metrics,
@@ -100,6 +103,9 @@ func main() {
 		RestartPod:     api.RestartPod,
 		GetOptimalNode: api.GetOptimalNode,
 		ChangeNode:     api.ChangeNode,
+		SetPreference:  api.SetPreference,
+		DelPreference:  api.DeletePreference,
+		GetPreference:  api.GetPreference,
 	}
 	mux := httptransport.NewRouter(handlers)
 

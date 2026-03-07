@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -103,6 +104,9 @@ func schedulePod(clientset *kubernetes.Clientset, pod *v1.Pod) error {
 		return fmt.Errorf("no nodes available for scheduling pod %s/%s", freshPod.Namespace, freshPod.Name)
 	}
 
+	// Build a map of eligible nodes (ready, schedulable, not control-plane)
+	eligibleNodes := buildEligibleNodeMap(nodes.Items, freshPod)
+
 	// Get service name from pod labels
 	serviceName := getServiceName(freshPod)
 
@@ -110,7 +114,15 @@ func schedulePod(clientset *kubernetes.Clientset, pod *v1.Pod) error {
 	selectedNode := getOptimalNode(freshPod.Namespace, serviceName)
 
 	if selectedNode == "" {
-		log.Printf("No optimal node for pod %s/%s, delegating scheduling to %s", freshPod.Namespace, freshPod.Name, defaultSchedulerName)
+		log.Printf("No optimal node for pod %s/%s, delegating to %s",
+			freshPod.Namespace, freshPod.Name, defaultSchedulerName)
+		return delegateToDefaultScheduler(ctx, clientset, freshPod)
+	}
+
+	// Validate the selected node is eligible
+	if !eligibleNodes[selectedNode] {
+		log.Printf("Selected node %s is NOT eligible for pod %s/%s (not ready, unschedulable, or control-plane), delegating to %s",
+			selectedNode, freshPod.Namespace, freshPod.Name, defaultSchedulerName)
 		return delegateToDefaultScheduler(ctx, clientset, freshPod)
 	}
 
@@ -132,10 +144,141 @@ func schedulePod(clientset *kubernetes.Clientset, pod *v1.Pod) error {
 
 	err = clientset.CoreV1().Pods(freshPod.Namespace).Bind(ctx, binding, metav1.CreateOptions{})
 	if err != nil {
-		return fmt.Errorf("failed to bind pod: %w", err)
+		log.Printf("Failed to bind pod %s/%s to node %s: %v, delegating to %s",
+			freshPod.Namespace, freshPod.Name, selectedNode, err, defaultSchedulerName)
+		return delegateToDefaultScheduler(ctx, clientset, freshPod)
 	}
 
 	return nil
+}
+
+// buildEligibleNodeMap returns a set of node names that are ready, schedulable,
+// and not control-plane nodes. This acts as a basic eligibility filter similar
+// to what the default kube-scheduler would apply.
+func buildEligibleNodeMap(nodes []v1.Node, pod *v1.Pod) map[string]bool {
+	eligible := make(map[string]bool, len(nodes))
+	for _, node := range nodes {
+		// Must be schedulable
+		if node.Spec.Unschedulable {
+			log.Printf("Node %s is unschedulable, skipping", node.Name)
+			continue
+		}
+
+		// Must be Ready
+		ready := false
+		for _, cond := range node.Status.Conditions {
+			if cond.Type == v1.NodeReady && cond.Status == v1.ConditionTrue {
+				ready = true
+				break
+			}
+		}
+		if !ready {
+			log.Printf("Node %s is not ready, skipping", node.Name)
+			continue
+		}
+
+		// Check if the node is a control-plane node
+		if isControlPlaneNode(&node) {
+			// Only allow scheduling on control-plane if the pod tolerates the taint
+			if !podToleratesControlPlaneTaints(pod, &node) {
+				log.Printf("Node %s is control-plane and pod lacks toleration, skipping", node.Name)
+				continue
+			}
+		}
+
+		// Check all node taints are tolerated by the pod
+		if !podToleratesAllTaints(pod, &node) {
+			log.Printf("Node %s has untolerated taints, skipping", node.Name)
+			continue
+		}
+
+		eligible[node.Name] = true
+	}
+	return eligible
+}
+
+// isControlPlaneNode checks if a node is a control-plane/master node
+func isControlPlaneNode(node *v1.Node) bool {
+	labels := node.Labels
+	if _, ok := labels["node-role.kubernetes.io/control-plane"]; ok {
+		return true
+	}
+	if _, ok := labels["node-role.kubernetes.io/master"]; ok {
+		return true
+	}
+	// Name-based fallback
+	nameLower := strings.ToLower(node.Name)
+	if strings.Contains(nameLower, "control-plane") || strings.Contains(nameLower, "master") {
+		return true
+	}
+	// Detect patterns like k8s-cp1
+	parts := strings.Split(nameLower, "-")
+	for _, part := range parts {
+		if len(part) >= 2 && strings.HasPrefix(part, "cp") {
+			allDigits := true
+			for _, ch := range part[2:] {
+				if ch < '0' || ch > '9' {
+					allDigits = false
+					break
+				}
+			}
+			if allDigits {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// podToleratesControlPlaneTaints checks if the pod has tolerations for control-plane taints
+func podToleratesControlPlaneTaints(pod *v1.Pod, node *v1.Node) bool {
+	for _, taint := range node.Spec.Taints {
+		if taint.Key == "node-role.kubernetes.io/control-plane" ||
+			taint.Key == "node-role.kubernetes.io/master" {
+			if !hasToleration(pod, taint) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// podToleratesAllTaints checks if the pod tolerates all NoSchedule/NoExecute taints on the node
+func podToleratesAllTaints(pod *v1.Pod, node *v1.Node) bool {
+	for _, taint := range node.Spec.Taints {
+		if taint.Effect == v1.TaintEffectNoSchedule || taint.Effect == v1.TaintEffectNoExecute {
+			if !hasToleration(pod, taint) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// hasToleration checks if a pod has a matching toleration for a taint
+func hasToleration(pod *v1.Pod, taint v1.Taint) bool {
+	for _, toleration := range pod.Spec.Tolerations {
+		if toleration.Operator == v1.TolerationOpExists && toleration.Key == "" {
+			return true // Tolerates everything
+		}
+		if toleration.Key == taint.Key {
+			if toleration.Operator == v1.TolerationOpExists {
+				return true
+			}
+			if toleration.Operator == v1.TolerationOpEqual && toleration.Value == taint.Value {
+				if toleration.Effect == "" || toleration.Effect == taint.Effect {
+					return true
+				}
+			}
+			// Default operator is Equal
+			if toleration.Operator == "" && toleration.Value == taint.Value {
+				if toleration.Effect == "" || toleration.Effect == taint.Effect {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func delegateToDefaultScheduler(ctx context.Context, clientset *kubernetes.Clientset, pod *v1.Pod) error {

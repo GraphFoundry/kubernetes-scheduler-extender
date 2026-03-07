@@ -20,6 +20,8 @@ const (
 	nodeKeyPrefix        = "node:"
 	podIntentPrefix      = "pod:"
 	roundRobinKeyPrefix  = "rr:"
+	preferenceKeyPrefix  = "scheduler:preference:"
+	overrideKeyPrefix    = "scheduler:override:"
 )
 
 // Lua script for atomic reservation with version check
@@ -82,11 +84,50 @@ redis.call('SET', nodeKey, cjson.encode(node))
 return node.version
 `
 
+// Lua script for partial‐merge of node state.
+// Only overwrites allocatable/capacity/meta fields; preserves version, cpu_used_m,
+// mem_used_bytes, and pods_used that may have been atomically updated by reservations.
+const mergeNodeStateLuaScript = `
+local key   = KEYS[1]
+local patch = cjson.decode(ARGV[1])
+
+local raw = redis.call('GET', key)
+local node
+if raw then
+    node = cjson.decode(raw)
+else
+    node = {}
+end
+
+-- Safe fields to overwrite from API sync
+node.name                = patch.name
+node.arch                = patch.arch
+node.os                  = patch.os
+node.cpu_allocatable_m   = patch.cpu_allocatable_m
+node.mem_allocatable_bytes = patch.mem_allocatable_bytes
+node.pods_allocatable    = patch.pods_allocatable
+node.ready               = patch.ready
+node.taints              = patch.taints
+node.labels              = patch.labels
+
+-- Only set usage fields if the key did not exist (first sync)
+if not raw then
+    node.cpu_used_m       = patch.cpu_used_m
+    node.mem_used_bytes   = patch.mem_used_bytes
+    node.pods_used        = patch.pods_used
+    node.version          = patch.version
+end
+
+redis.call('SET', key, cjson.encode(node))
+return 1
+`
+
 // SchedulerRepository handles all Redis operations for scheduler
 type SchedulerRepository struct {
-	rdb            *goredis.Client
-	reserveScript  *goredis.Script
-	rollbackScript *goredis.Script
+	rdb              *goredis.Client
+	reserveScript    *goredis.Script
+	rollbackScript   *goredis.Script
+	mergeNodeScript  *goredis.Script
 }
 
 func (r *SchedulerRepository) SetValue(ctx context.Context, key, value string, ttl time.Duration) error {
@@ -123,9 +164,10 @@ func NewSchedulerRepository(addr string) *SchedulerRepository {
 	})
 
 	return &SchedulerRepository{
-		rdb:            rdb,
-		reserveScript:  goredis.NewScript(reserveLuaScript),
-		rollbackScript: goredis.NewScript(rollbackLuaScript),
+		rdb:             rdb,
+		reserveScript:   goredis.NewScript(reserveLuaScript),
+		rollbackScript:  goredis.NewScript(rollbackLuaScript),
+		mergeNodeScript: goredis.NewScript(mergeNodeStateLuaScript),
 	}
 }
 
@@ -152,7 +194,9 @@ func (r *SchedulerRepository) GetNodeState(ctx context.Context, nodeName string)
 	return &state, nil
 }
 
-// SetNodeState updates node state in Redis
+// SetNodeState merges node state into Redis (partial update).
+// Only overwrites safe metadata/capacity fields; preserves usage fields
+// that may have been atomically updated by reservation scripts.
 func (r *SchedulerRepository) SetNodeState(ctx context.Context, state *models.NodeState) error {
 	data, err := json.Marshal(state)
 	if err != nil {
@@ -160,7 +204,7 @@ func (r *SchedulerRepository) SetNodeState(ctx context.Context, state *models.No
 	}
 
 	key := nodeKeyPrefix + state.Name
-	return r.rdb.Set(ctx, key, data, 0).Err()
+	return r.mergeNodeScript.Run(ctx, r.rdb, []string{key}, string(data)).Err()
 }
 
 // ListNodeStates retrieves all node states
@@ -336,4 +380,64 @@ func (r *SchedulerRepository) GetAndIncrementRoundRobin(ctx context.Context, ser
 	r.rdb.Expire(ctx, key, 30*time.Minute)
 	// INCR returns the value *after* increment, so subtract 1 to get the index before increment
 	return val - 1, nil
+}
+
+// preferenceKey builds the Redis key for a service's node preference
+func preferenceKey(namespace, service string) string {
+	return preferenceKeyPrefix + namespace + ":" + service
+}
+
+// SetNodePreference stores the user's preferred node for a service
+func (r *SchedulerRepository) SetNodePreference(ctx context.Context, namespace, service, nodeName string) error {
+	return r.rdb.Set(ctx, preferenceKey(namespace, service), nodeName, 0).Err()
+}
+
+// GetNodePreference returns the user's preferred node (empty string if none)
+func (r *SchedulerRepository) GetNodePreference(ctx context.Context, namespace, service string) (string, error) {
+	val, err := r.rdb.Get(ctx, preferenceKey(namespace, service)).Result()
+	if err == goredis.Nil {
+		return "", nil
+	}
+	return val, err
+}
+
+// DeleteNodePreference removes the user's preferred node for a service
+func (r *SchedulerRepository) DeleteNodePreference(ctx context.Context, namespace, service string) error {
+	return r.rdb.Del(ctx, preferenceKey(namespace, service)).Err()
+}
+
+// overrideKey builds the Redis key for a pending node override
+func overrideKey(namespace, service string) string {
+	return overrideKeyPrefix + namespace + ":" + service
+}
+
+// SetNodeOverride stores a one-time node override for a service (used by change-node).
+// The override has a short TTL and is consumed (deleted) when read.
+func (r *SchedulerRepository) SetNodeOverride(ctx context.Context, namespace, service, nodeName string) error {
+	return r.rdb.Set(ctx, overrideKey(namespace, service), nodeName, 2*time.Minute).Err()
+}
+
+// ConsumeNodeOverride atomically gets and deletes a pending node override.
+// Returns the target node and true if an override existed, or ("", false) if none.
+func (r *SchedulerRepository) ConsumeNodeOverride(ctx context.Context, namespace, service string) (string, bool) {
+	key := overrideKey(namespace, service)
+
+	// Atomic GET + DEL via Lua to prevent race conditions
+	script := `
+		local val = redis.call("GET", KEYS[1])
+		if val then
+			redis.call("DEL", KEYS[1])
+			return val
+		end
+		return false
+	`
+	result, err := r.rdb.Eval(ctx, script, []string{key}).Result()
+	if err != nil || result == nil {
+		return "", false
+	}
+	node, ok := result.(string)
+	if !ok || node == "" {
+		return "", false
+	}
+	return node, true
 }

@@ -26,11 +26,26 @@ type RoundRobinCounter interface {
 	GetAndIncrementRoundRobin(ctx context.Context, service string) (int64, error)
 }
 
+// PreferenceStore provides read/write access to user node preferences
+type PreferenceStore interface {
+	SetNodePreference(ctx context.Context, namespace, service, nodeName string) error
+	GetNodePreference(ctx context.Context, namespace, service string) (string, error)
+	DeleteNodePreference(ctx context.Context, namespace, service string) error
+}
+
+// OverrideStore provides one-time node override for change-node operations
+type OverrideStore interface {
+	SetNodeOverride(ctx context.Context, namespace, service, nodeName string) error
+	ConsumeNodeOverride(ctx context.Context, namespace, service string) (string, bool)
+}
+
 type API struct {
 	repo          DecisionReader
 	scheduler     *scheduler.Scheduler
 	clientset     *kubernetes.Clientset
 	rrCounter     RoundRobinCounter
+	prefStore     PreferenceStore
+	overrideStore OverrideStore
 	metricsTextFn func() string
 	topK          int
 	targetService string
@@ -58,6 +73,16 @@ func (a *API) SetMetricsHandler(fn func() string) {
 // SetRoundRobinCounter sets the round-robin counter for pod distribution
 func (a *API) SetRoundRobinCounter(rr RoundRobinCounter) {
 	a.rrCounter = rr
+}
+
+// SetPreferenceStore sets the preference store for user node preferences
+func (a *API) SetPreferenceStore(ps PreferenceStore) {
+	a.prefStore = ps
+}
+
+// SetOverrideStore sets the override store for change-node operations
+func (a *API) SetOverrideStore(os OverrideStore) {
+	a.overrideStore = os
 }
 
 func (a *API) Health(w http.ResponseWriter, r *http.Request) {
@@ -140,6 +165,27 @@ func (a *API) Prioritize(w http.ResponseWriter, r *http.Request) {
 			len(nodes),
 		)
 
+		// Check for a pending change-node override first (highest priority)
+		if a.overrideStore != nil {
+			if overrideNode, ok := a.overrideStore.ConsumeNodeOverride(r.Context(), namespace, service); ok {
+				log.Printf("[HTTP][PRIORITIZE] override consumed service=%s node=%s", service, overrideNode)
+				out := generateScoresForNode(nodes, overrideNode)
+				writeJSON(w, out)
+				return
+			}
+		}
+
+		// Check for a persistent user preference (always honored over scorer decisions)
+		if a.prefStore != nil {
+			prefNode, prefErr := a.prefStore.GetNodePreference(r.Context(), namespace, service)
+			if prefErr == nil && prefNode != "" {
+				log.Printf("[HTTP][PRIORITIZE] user preference found service=%s node=%s", service, prefNode)
+				out := generateScoresForNode(nodes, prefNode)
+				writeJSON(w, out)
+				return
+			}
+		}
+
 		decision, err := a.repo.Get(r.Context(), namespace, service)
 		if err == nil {
 			// Found a decision! Apply round-robin to distribute pods across nodes.
@@ -203,6 +249,34 @@ func (a *API) GetOptimalNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 1. Check for a pending change-node override (one-time, consumed on read)
+	if a.overrideStore != nil {
+		if overrideNode, ok := a.overrideStore.ConsumeNodeOverride(r.Context(), namespace, service); ok {
+			log.Printf("[HTTP][OPTIMAL] override consumed namespace=%s service=%s node=%s", namespace, service, overrideNode)
+			writeJSON(w, map[string]any{
+				"node":     overrideNode,
+				"found":    true,
+				"override": true,
+			})
+			return
+		}
+	}
+
+	// 2. Check for a persistent user preference (always honored)
+	if a.prefStore != nil {
+		prefNode, err := a.prefStore.GetNodePreference(r.Context(), namespace, service)
+		if err == nil && prefNode != "" {
+			log.Printf("[HTTP][OPTIMAL] user preference found namespace=%s service=%s node=%s", namespace, service, prefNode)
+			writeJSON(w, map[string]any{
+				"node":       prefNode,
+				"found":      true,
+				"preference": true,
+			})
+			return
+		}
+	}
+
+	// 3. Return precomputed decision from scorer
 	decision, err := a.repo.Get(r.Context(), namespace, service)
 	if err != nil {
 		writeJSON(w, map[string]any{
@@ -423,9 +497,23 @@ func (a *API) ChangeNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 4. Patch the deployment/replicaset with a nodeSelector to target the specific node
-	// For now, we delete the pod and let the scheduler place it.
-	// The pod's deployment can be patched with a node affinity if needed.
+	// 4. Extract service name from pod labels so we can store the override
+	serviceName := serviceNameFromPodLabels(pod.Labels)
+	if serviceName == "" {
+		log.Printf("[HTTP][CHANGE-NODE] WARNING: could not extract service name from pod labels, override may not work")
+	}
+
+	// 5. Store the node override in Redis BEFORE deleting the pod
+	if a.overrideStore != nil && serviceName != "" {
+		if err := a.overrideStore.SetNodeOverride(ctx, req.Namespace, serviceName, req.TargetNode); err != nil {
+			log.Printf("[HTTP][CHANGE-NODE] WARNING: failed to store override: %v", err)
+		} else {
+			log.Printf("[HTTP][CHANGE-NODE] stored node override namespace=%s service=%s targetNode=%s",
+				req.Namespace, serviceName, req.TargetNode)
+		}
+	}
+
+	// 6. Delete the pod so the controller recreates it
 	log.Printf("[HTTP][CHANGE-NODE] deleting pod=%s/%s (currentNode=%s) to reschedule to targetNode=%s",
 		req.Namespace, req.PodName, currentNode, req.TargetNode)
 
@@ -450,11 +538,139 @@ func (a *API) ChangeNode(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// SetPreference saves the user's preferred node for a service.
+// POST /preference  {"namespace":"default","service":"myapp","node":"worker-1"}
+func (a *API) SetPreference(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if a.prefStore == nil {
+		http.Error(w, "preference store not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req struct {
+		Namespace string `json:"namespace"`
+		Service   string `json:"service"`
+		Node      string `json:"node"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Namespace == "" {
+		req.Namespace = "default"
+	}
+	if req.Service == "" || req.Node == "" {
+		http.Error(w, "service and node are required", http.StatusBadRequest)
+		return
+	}
+
+	if err := a.prefStore.SetNodePreference(r.Context(), req.Namespace, req.Service, req.Node); err != nil {
+		log.Printf("[HTTP][PREFERENCE] set failed: %v", err)
+		http.Error(w, "failed to set preference", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[HTTP][PREFERENCE] set namespace=%s service=%s node=%s", req.Namespace, req.Service, req.Node)
+	writeJSON(w, map[string]any{
+		"success":   true,
+		"namespace": req.Namespace,
+		"service":   req.Service,
+		"node":      req.Node,
+		"message":   "Preference saved",
+	})
+}
+
+// DeletePreference removes the user's preferred node for a service.
+// DELETE /preference?namespace=default&service=myapp
+func (a *API) DeletePreference(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if a.prefStore == nil {
+		http.Error(w, "preference store not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	namespace := r.URL.Query().Get("namespace")
+	if namespace == "" {
+		namespace = "default"
+	}
+	service := r.URL.Query().Get("service")
+	if service == "" {
+		http.Error(w, "service parameter required", http.StatusBadRequest)
+		return
+	}
+
+	if err := a.prefStore.DeleteNodePreference(r.Context(), namespace, service); err != nil {
+		log.Printf("[HTTP][PREFERENCE] delete failed: %v", err)
+		http.Error(w, "failed to delete preference", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[HTTP][PREFERENCE] deleted namespace=%s service=%s", namespace, service)
+	writeJSON(w, map[string]any{
+		"success":   true,
+		"namespace": namespace,
+		"service":   service,
+		"message":   "Preference removed — scheduler logic takes over",
+	})
+}
+
+// GetPreference returns the user's preferred node for a service.
+// GET /preference?namespace=default&service=myapp
+func (a *API) GetPreference(w http.ResponseWriter, r *http.Request) {
+	if a.prefStore == nil {
+		http.Error(w, "preference store not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	namespace := r.URL.Query().Get("namespace")
+	if namespace == "" {
+		namespace = "default"
+	}
+	service := r.URL.Query().Get("service")
+	if service == "" {
+		http.Error(w, "service parameter required", http.StatusBadRequest)
+		return
+	}
+
+	node, err := a.prefStore.GetNodePreference(r.Context(), namespace, service)
+	if err != nil {
+		log.Printf("[HTTP][PREFERENCE] get failed: %v", err)
+		http.Error(w, "failed to get preference", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, map[string]any{
+		"namespace": namespace,
+		"service":   service,
+		"node":      node,
+		"hasPreference": node != "",
+	})
+}
+
 /* ---------------- helpers ---------------- */
 
 // scoresFromDecisionRoundRobin distributes pods across nodes using round-robin.
-// Instead of always giving the bestNode the highest score, it rotates which node gets the top score.
+// If a user preference exists, the preferred node always gets the highest score.
 func (a *API) scoresFromDecisionRoundRobin(ctx context.Context, nodes []string, d *models.Decision, service string) []models.HostPriority {
+	// If user has a preference, always prioritise that node
+	if d.PreferredNode != "" {
+		for _, n := range nodes {
+			if n == d.PreferredNode {
+				log.Printf("[HTTP][PRIORITIZE][PREF] using preferred node=%s for service=%s", d.PreferredNode, service)
+				return generateScoresForNode(nodes, d.PreferredNode)
+			}
+		}
+		log.Printf("[HTTP][PRIORITIZE][PREF] preferred node=%s not in candidate list, falling back", d.PreferredNode)
+	}
+
 	if len(nodes) <= 1 || a.rrCounter == nil {
 		return scoresFromDecision(nodes, d)
 	}
@@ -558,4 +774,24 @@ func writeJSON(w http.ResponseWriter, v any) {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(v)
+}
+
+// serviceNameFromPodLabels extracts the service name from pod labels
+func serviceNameFromPodLabels(labels map[string]string) string {
+	if v := labels["extender.kubernetes.io/name"]; v != "" {
+		return v
+	}
+	if v := labels["extender"]; v != "" {
+		return v
+	}
+	if v := labels["k8s-extender"]; v != "" {
+		return v
+	}
+	if v := labels["service.istio.io/canonical-name"]; v != "" {
+		return v
+	}
+	if v := labels["app"]; v != "" {
+		return v
+	}
+	return ""
 }
