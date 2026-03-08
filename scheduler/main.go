@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -20,7 +19,8 @@ import (
 )
 
 const (
-	schedulerName = "my-scheduler"
+	schedulerName        = "my-scheduler"
+	defaultSchedulerName = "default-scheduler"
 )
 
 type OptimalResponse struct {
@@ -109,14 +109,12 @@ func schedulePod(clientset *kubernetes.Clientset, pod *v1.Pod) error {
 	// Try to get optimal node from best-node-selector
 	selectedNode := getOptimalNode(freshPod.Namespace, serviceName)
 
-	// Fallback: pick first non-primary node, or only node if single
 	if selectedNode == "" {
-		selectedNode = selectFallbackNode(nodes.Items)
-		log.Printf("Using fallback node selection: %s", selectedNode)
-	} else {
-		log.Printf("Using optimal node from best-node-selector: %s", selectedNode)
+		log.Printf("No optimal node for pod %s/%s, delegating scheduling to %s", freshPod.Namespace, freshPod.Name, defaultSchedulerName)
+		return delegateToDefaultScheduler(ctx, clientset, freshPod)
 	}
 
+	log.Printf("Using optimal node from best-node-selector: %s", selectedNode)
 	log.Printf("Selected node %s for pod %s/%s", selectedNode, freshPod.Namespace, freshPod.Name)
 
 	binding := &v1.Binding{
@@ -137,6 +135,27 @@ func schedulePod(clientset *kubernetes.Clientset, pod *v1.Pod) error {
 		return fmt.Errorf("failed to bind pod: %w", err)
 	}
 
+	return nil
+}
+
+func delegateToDefaultScheduler(ctx context.Context, clientset *kubernetes.Clientset, pod *v1.Pod) error {
+	if pod.Spec.NodeName != "" {
+		return nil
+	}
+
+	if pod.Spec.SchedulerName == defaultSchedulerName {
+		return nil
+	}
+
+	podCopy := pod.DeepCopy()
+	podCopy.Spec.SchedulerName = defaultSchedulerName
+
+	_, err := clientset.CoreV1().Pods(pod.Namespace).Update(ctx, podCopy, metav1.UpdateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to delegate pod to %s: %w", defaultSchedulerName, err)
+	}
+
+	log.Printf("Delegated pod %s/%s to %s", pod.Namespace, pod.Name, defaultSchedulerName)
 	return nil
 }
 
@@ -187,35 +206,4 @@ func getOptimalNode(namespace, service string) string {
 	}
 
 	return ""
-}
-
-// selectFallbackNode picks the first non-primary node, or the only node if single
-func selectFallbackNode(nodes []v1.Node) string {
-	if len(nodes) == 1 {
-		return nodes[0].Name
-	}
-
-	// Find first non-primary (worker) node
-	for _, node := range nodes {
-		if isWorkerNode(&node) {
-			return node.Name
-		}
-	}
-
-	// All nodes are primary, return first one
-	return nodes[0].Name
-}
-
-// isWorkerNode returns true if the node is not a primary/master/control-plane node
-func isWorkerNode(node *v1.Node) bool {
-	// Check minikube label first
-	if val, ok := node.Labels["minikube.k8s.io/primary"]; ok {
-		return val == "false"
-	}
-
-	// Fallback: check node name
-	name := strings.ToLower(node.Name)
-	return !strings.Contains(name, "primary") &&
-		!strings.Contains(name, "master") &&
-		!strings.Contains(name, "control-plane")
 }
