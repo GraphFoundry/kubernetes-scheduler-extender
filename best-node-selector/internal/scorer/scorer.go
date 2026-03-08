@@ -13,19 +13,27 @@ import (
 )
 
 const (
-	defaultTopKPeers     = 3
-	targetUtilization    = 0.65
-	utilizationBand      = 0.35
-	cpuHardCap           = 0.85
-	memHardCap           = 0.85
-	neutralNormFallback  = 0.5
-	localityWeight       = 0.4
-	spreadWeight         = 0.2
-	utilBaseWeight       = 0.3
-	utilCriticalitySlope = 0.2
-	riskBaseWeight       = 0.1
-	riskCriticalitySlope = 0.2
+	defaultTopKPeers       = 3
+	targetUtilization      = 0.65
+	utilizationBand        = 0.35
+	cpuHardCap             = 0.85
+	memHardCap             = 0.85
+	neutralNormFallback    = 0.5
+	localityWeight         = 0.4
+	spreadWeight           = 0.2
+	utilBaseWeight         = 0.3
+	utilCriticalitySlope   = 0.2
+	riskBaseWeight         = 0.1
+	riskCriticalitySlope   = 0.2
+	concentrationWeight    = 0.25
+	nodeDensityWeight      = 0.15
 )
+
+// CycleState tracks bestNode selections within a single scoring cycle
+// to prevent all services from converging on the same node.
+type CycleState struct {
+	NodeSelections map[string]int // node -> number of times picked as bestNode this cycle
+}
 
 type Scorer struct {
 	metrics    services.MetricsProvider
@@ -72,7 +80,12 @@ func (s *Scorer) ComputeForService(
 	service string,
 	nodes []string,
 	windowSeconds int,
+	cycleState ...* CycleState,
 ) {
+	var cs *CycleState
+	if len(cycleState) > 0 && cycleState[0] != nil {
+		cs = cycleState[0]
+	}
 	start := time.Now()
 	log.Printf("[SCORER] scoring service=%s nodes=%d", service, len(nodes))
 
@@ -125,12 +138,12 @@ func (s *Scorer) ComputeForService(
 	// 3b. Get node labels for worker detection
 	nodeLabels, _ := s.placement.GetNodeLabels(ctx)
 
-	// 4. Filter out primary/master nodes if workers exist
-	workerNodes := filterWorkerNodes(nodes, nodeLabels)
+	// 4. Filter out control-plane nodes only if they have NoSchedule/NoExecute taints
+	workerNodes := filterSchedulableNodes(nodes, nodeLabels, nodeRuntime)
 	targetNodes := nodes
 	if len(workerNodes) > 0 {
 		targetNodes = workerNodes
-		log.Printf("[SCORER] filtering to worker nodes only: %v", workerNodes)
+		log.Printf("[SCORER] filtering to schedulable nodes: %v", workerNodes)
 	}
 
 	criticalityByService, criticality := computeCriticality(service, centrality, servicesSnapshot)
@@ -195,6 +208,44 @@ func (s *Scorer) ComputeForService(
 		}
 	}
 
+	// Compute node density score: penalise nodes running many services
+	nodeDensityScore := make(map[string]float64, len(feasibleNodes))
+	maxSvcCount := 0
+	for _, node := range feasibleNodes {
+		count := len(nodeRuntime[node].Services)
+		if count > maxSvcCount {
+			maxSvcCount = count
+		}
+	}
+	for _, node := range feasibleNodes {
+		if maxSvcCount > 0 {
+			// Fewer services → higher score (more room)
+			nodeDensityScore[node] = 1.0 - float64(len(nodeRuntime[node].Services))/float64(maxSvcCount+1)
+		} else {
+			nodeDensityScore[node] = 1.0
+		}
+	}
+
+	// Compute concentration penalty from cycle state
+	concentrationScore := make(map[string]float64, len(feasibleNodes))
+	for _, node := range feasibleNodes {
+		concentrationScore[node] = 1.0 // no penalty by default
+	}
+	if cs != nil && len(cs.NodeSelections) > 0 {
+		maxSel := 0
+		for _, count := range cs.NodeSelections {
+			if count > maxSel {
+				maxSel = count
+			}
+		}
+		if maxSel > 0 {
+			for _, node := range feasibleNodes {
+				selCount := cs.NodeSelections[node]
+				concentrationScore[node] = 1.0 - float64(selCount)/float64(maxSel+1)
+			}
+		}
+	}
+
 	localityScore := normalizeMapValues(localityRaw, feasibleNodes)
 	nodeCriticalNorm := normalizeMapValues(nodeCriticalMass, feasibleNodes)
 
@@ -207,7 +258,9 @@ func (s *Scorer) ComputeForService(
 		rawScores[node] =
 			localityWeight*localityScore[node] +
 				utilWeight*utilScore[node] +
-				spreadWeight*spreadScore[node] -
+				spreadWeight*spreadScore[node] +
+				nodeDensityWeight*nodeDensityScore[node] +
+				concentrationWeight*concentrationScore[node] -
 				riskWeight*riskPenalty
 	}
 
@@ -260,6 +313,11 @@ func (s *Scorer) ComputeForService(
 	if err := s.repo.Save(ctx, decision); err != nil {
 		log.Printf("[SCORER][ERROR] save failed service=%s: %v", service, err)
 		return
+	}
+
+	// Record this selection in cycle state so subsequent services avoid piling on the same node
+	if cs != nil {
+		cs.NodeSelections[decision.BestNode]++
 	}
 
 	log.Printf("[SCORER] done service=%s best=%s peers=%d duration=%dms",
@@ -459,42 +517,60 @@ func medianInt64(vals []int64) int64 {
 	return (sorted[mid-1] + sorted[mid]) / 2
 }
 
-// filterWorkerNodes returns only worker nodes (excludes primary/master/control-plane nodes)
-func filterWorkerNodes(nodes []string, nodeLabels map[string]map[string]string) []string {
-	workers := []string{}
+// filterSchedulableNodes returns nodes eligible for scheduling.
+// Control-plane nodes are included if they have no NoSchedule/NoExecute taints.
+func filterSchedulableNodes(nodes []string, nodeLabels map[string]map[string]string, nodeRuntime map[string]services.NodeRuntime) []string {
+	var schedulable []string
 	for _, node := range nodes {
-		if isWorkerNode(node, nodeLabels) {
-			workers = append(workers, node)
+		if isControlPlaneNode(node, nodeLabels) && hasBlockingTaints(node, nodeRuntime) {
+			continue
 		}
+		schedulable = append(schedulable, node)
 	}
-	return workers
+	return schedulable
 }
 
-// isWorkerNode returns true if the node is not a primary/master/control-plane node
-func isWorkerNode(nodeName string, nodeLabels map[string]map[string]string) bool {
+// isControlPlaneNode returns true if the node is a primary/master/control-plane node
+func isControlPlaneNode(nodeName string, nodeLabels map[string]map[string]string) bool {
 	if nodeLabels != nil {
 		if labels, ok := nodeLabels[nodeName]; ok {
-			// Check minikube label
 			if primary, ok := labels["minikube.k8s.io/primary"]; ok {
-				return primary == "false"
+				return primary == "true"
 			}
-			// Check standard kubeadm control-plane / master labels
 			if _, ok := labels["node-role.kubernetes.io/control-plane"]; ok {
-				return false
+				return true
 			}
 			if _, ok := labels["node-role.kubernetes.io/master"]; ok {
-				return false
+				return true
 			}
 		}
 	}
-	// Fallback to name-based detection
 	nodeLower := strings.ToLower(nodeName)
-	return !strings.Contains(nodeLower, "primary") &&
-		!strings.Contains(nodeLower, "master") &&
-		!strings.Contains(nodeLower, "control-plane") &&
-		!strings.HasSuffix(nodeLower, "-cp") &&
-		!strings.Contains(nodeLower, "-cp-") &&
-		!matchControlPlanePattern(nodeLower)
+	return strings.Contains(nodeLower, "primary") ||
+		strings.Contains(nodeLower, "master") ||
+		strings.Contains(nodeLower, "control-plane") ||
+		strings.HasSuffix(nodeLower, "-cp") ||
+		strings.Contains(nodeLower, "-cp-") ||
+		matchControlPlanePattern(nodeLower)
+}
+
+// hasBlockingTaints returns true if the node has NoSchedule or NoExecute taints
+func hasBlockingTaints(nodeName string, nodeRuntime map[string]services.NodeRuntime) bool {
+	rt, ok := nodeRuntime[nodeName]
+	if !ok {
+		return false
+	}
+	for _, t := range rt.Taints {
+		if t.Effect == "NoSchedule" || t.Effect == "NoExecute" {
+			return true
+		}
+	}
+	return false
+}
+
+// isWorkerNode returns true if the node is not a control-plane node (used for scoring bonus)
+func isWorkerNode(nodeName string, nodeLabels map[string]map[string]string) bool {
+	return !isControlPlaneNode(nodeName, nodeLabels)
 }
 
 // matchControlPlanePattern checks for patterns like k8s-cp1, node-cp2 etc.
@@ -534,20 +610,20 @@ func (s *Scorer) writeNeutralDecision(
 	nodeRuntime, _ := s.placement.GetNodeRuntime(ctx, []string{namespace})
 	currentNodes := getCurrentNodesFromRuntime(nodeRuntime, service)
 
-	// Filter to worker nodes if available
-	workerNodes := filterWorkerNodes(nodes, nodeLabels)
+	// Filter to schedulable nodes (include untainted CP nodes)
+	workerNodes := filterSchedulableNodes(nodes, nodeLabels, nodeRuntime)
 	targetNodes := nodes
 	if len(workerNodes) > 0 {
 		targetNodes = workerNodes
 	}
 
 	scores := make(map[string]int)
-	// Worker nodes get score 50, primary nodes get score 0
+	// Worker nodes get score 50, control-plane nodes get 30 (lower preference but still viable)
 	for _, node := range nodes {
 		if isWorkerNode(node, nodeLabels) {
 			scores[node] = 50
 		} else {
-			scores[node] = 0
+			scores[node] = 30
 		}
 	}
 

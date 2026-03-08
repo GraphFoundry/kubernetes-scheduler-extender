@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -20,8 +22,7 @@ import (
 )
 
 const (
-	schedulerName        = "my-scheduler"
-	defaultSchedulerName = "default-scheduler"
+	schedulerName = "my-scheduler"
 )
 
 type OptimalResponse struct {
@@ -113,20 +114,27 @@ func schedulePod(clientset *kubernetes.Clientset, pod *v1.Pod) error {
 	// Try to get optimal node from best-node-selector
 	selectedNode := getOptimalNode(freshPod.Namespace, serviceName)
 
+	needsFallback := false
 	if selectedNode == "" {
-		log.Printf("No optimal node for pod %s/%s, delegating to %s",
-			freshPod.Namespace, freshPod.Name, defaultSchedulerName)
-		return delegateToDefaultScheduler(ctx, clientset, freshPod)
+		log.Printf("No optimal node for pod %s/%s, falling back to default-scheduler scoring",
+			freshPod.Namespace, freshPod.Name)
+		needsFallback = true
+	} else if !eligibleNodes[selectedNode] {
+		log.Printf("Optimal node %s is NOT eligible for pod %s/%s, falling back to default-scheduler scoring",
+			selectedNode, freshPod.Namespace, freshPod.Name)
+		needsFallback = true
 	}
 
-	// Validate the selected node is eligible
-	if !eligibleNodes[selectedNode] {
-		log.Printf("Selected node %s is NOT eligible for pod %s/%s (not ready, unschedulable, or control-plane), delegating to %s",
-			selectedNode, freshPod.Namespace, freshPod.Name, defaultSchedulerName)
-		return delegateToDefaultScheduler(ctx, clientset, freshPod)
+	if needsFallback {
+		selectedNode, err = scoreAndSelectNode(ctx, clientset, nodes.Items, eligibleNodes, freshPod)
+		if err != nil {
+			return fmt.Errorf("fallback scheduling failed for pod %s/%s: %w", freshPod.Namespace, freshPod.Name, err)
+		}
+		log.Printf("Default-scheduler-style scoring selected node %s for pod %s/%s",
+			selectedNode, freshPod.Namespace, freshPod.Name)
+	} else {
+		log.Printf("Using optimal node from best-node-selector: %s", selectedNode)
 	}
-
-	log.Printf("Using optimal node from best-node-selector: %s", selectedNode)
 	log.Printf("Selected node %s for pod %s/%s", selectedNode, freshPod.Namespace, freshPod.Name)
 
 	binding := &v1.Binding{
@@ -144,9 +152,8 @@ func schedulePod(clientset *kubernetes.Clientset, pod *v1.Pod) error {
 
 	err = clientset.CoreV1().Pods(freshPod.Namespace).Bind(ctx, binding, metav1.CreateOptions{})
 	if err != nil {
-		log.Printf("Failed to bind pod %s/%s to node %s: %v, delegating to %s",
-			freshPod.Namespace, freshPod.Name, selectedNode, err, defaultSchedulerName)
-		return delegateToDefaultScheduler(ctx, clientset, freshPod)
+		return fmt.Errorf("failed to bind pod %s/%s to node %s: %w",
+			freshPod.Namespace, freshPod.Name, selectedNode, err)
 	}
 
 	return nil
@@ -281,25 +288,123 @@ func hasToleration(pod *v1.Pod, taint v1.Taint) bool {
 	return false
 }
 
-func delegateToDefaultScheduler(ctx context.Context, clientset *kubernetes.Clientset, pod *v1.Pod) error {
-	if pod.Spec.NodeName != "" {
-		return nil
+// scoreAndSelectNode replicates the default kube-scheduler's core scoring:
+// LeastRequestedPriority + BalancedResourceAllocation.
+// It sums resource requests of all non-terminal pods on each eligible node,
+// then picks the node with the highest combined score.
+func scoreAndSelectNode(ctx context.Context, clientset *kubernetes.Clientset, nodes []v1.Node, eligible map[string]bool, pod *v1.Pod) (string, error) {
+	// Index allocatable resources by node name for eligible nodes
+	type nodeResources struct {
+		node       string
+		allocCPU   int64 // milliCPU
+		allocMem   int64 // bytes
+		reqCPU     int64
+		reqMem     int64
 	}
 
-	if pod.Spec.SchedulerName == defaultSchedulerName {
-		return nil
+	nodeMap := make(map[string]*nodeResources, len(eligible))
+	for _, n := range nodes {
+		if !eligible[n.Name] {
+			continue
+		}
+		nodeMap[n.Name] = &nodeResources{
+			node:     n.Name,
+			allocCPU: n.Status.Allocatable.Cpu().MilliValue(),
+			allocMem: n.Status.Allocatable.Memory().Value(),
+		}
 	}
 
-	podCopy := pod.DeepCopy()
-	podCopy.Spec.SchedulerName = defaultSchedulerName
+	if len(nodeMap) == 0 {
+		return "", fmt.Errorf("no eligible nodes")
+	}
 
-	_, err := clientset.CoreV1().Pods(pod.Namespace).Update(ctx, podCopy, metav1.UpdateOptions{})
+	// Sum existing pod resource requests per node
+	allPods, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return fmt.Errorf("failed to delegate pod to %s: %w", defaultSchedulerName, err)
+		return "", fmt.Errorf("failed to list pods for resource accounting: %w", err)
 	}
 
-	log.Printf("Delegated pod %s/%s to %s", pod.Namespace, pod.Name, defaultSchedulerName)
-	return nil
+	for i := range allPods.Items {
+		p := &allPods.Items[i]
+		if p.Spec.NodeName == "" {
+			continue
+		}
+		if p.Status.Phase == v1.PodSucceeded || p.Status.Phase == v1.PodFailed {
+			continue
+		}
+		nr, ok := nodeMap[p.Spec.NodeName]
+		if !ok {
+			continue
+		}
+		for _, c := range p.Spec.Containers {
+			nr.reqCPU += c.Resources.Requests.Cpu().MilliValue()
+			nr.reqMem += c.Resources.Requests.Memory().Value()
+		}
+		for _, c := range p.Spec.InitContainers {
+			// Init containers run sequentially; use max, not sum
+			cpuReq := c.Resources.Requests.Cpu().MilliValue()
+			memReq := c.Resources.Requests.Memory().Value()
+			if cpuReq > nr.reqCPU {
+				nr.reqCPU = cpuReq
+			}
+			if memReq > nr.reqMem {
+				nr.reqMem = memReq
+			}
+		}
+	}
+
+	// Add the incoming pod's own requests
+	var podCPU, podMem int64
+	for _, c := range pod.Spec.Containers {
+		podCPU += c.Resources.Requests.Cpu().MilliValue()
+		podMem += c.Resources.Requests.Memory().Value()
+	}
+
+	// Score each node — higher is better
+	bestNode := ""
+	bestScore := -1.0
+
+	for name, nr := range nodeMap {
+		usedCPU := nr.reqCPU + podCPU
+		usedMem := nr.reqMem + podMem
+
+		// Check if the pod actually fits
+		if usedCPU > nr.allocCPU || usedMem > nr.allocMem {
+			log.Printf("[FALLBACK] node %s cannot fit pod (cpu=%dm/%dm mem=%d/%d), skipping",
+				name, usedCPU, nr.allocCPU, usedMem, nr.allocMem)
+			continue
+		}
+
+		// LeastRequestedPriority: prefer nodes with more free resources
+		cpuScore := float64(nr.allocCPU-usedCPU) / float64(nr.allocCPU) * 100
+		memScore := float64(nr.allocMem-usedMem) / float64(nr.allocMem) * 100
+		leastRequested := (cpuScore + memScore) / 2
+
+		// BalancedResourceAllocation: prefer nodes where CPU/mem usage is balanced
+		cpuFraction := float64(usedCPU) / float64(nr.allocCPU)
+		memFraction := float64(usedMem) / float64(nr.allocMem)
+		balanced := (1 - math.Abs(cpuFraction-memFraction)) * 100
+
+		// Combined score (default scheduler weights these equally)
+		score := leastRequested + balanced
+
+		log.Printf("[FALLBACK] node %s score=%.1f (leastReq=%.1f balanced=%.1f) cpu=%dm/%dm mem=%s/%s",
+			name, score, leastRequested, balanced,
+			usedCPU, nr.allocCPU,
+			resource.NewQuantity(usedMem, resource.BinarySI).String(),
+			resource.NewQuantity(nr.allocMem, resource.BinarySI).String())
+
+		if score > bestScore {
+			bestScore = score
+			bestNode = name
+		}
+	}
+
+	if bestNode == "" {
+		return "", fmt.Errorf("no nodes with sufficient resources")
+	}
+
+	return bestNode, nil
 }
 
 // getServiceName extracts service name from pod labels

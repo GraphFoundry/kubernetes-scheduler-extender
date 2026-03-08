@@ -138,6 +138,14 @@ func (p *K8sPlacementProvider) GetNodeRuntime(ctx context.Context, namespaces []
 			}
 		}
 
+		var taints []NodeTaint
+		for _, t := range node.Spec.Taints {
+			taints = append(taints, NodeTaint{
+				Key:    t.Key,
+				Effect: string(t.Effect),
+			})
+		}
+
 		runtime[node.Name] = NodeRuntime{
 			Name:             node.Name,
 			Ready:            ready,
@@ -147,6 +155,7 @@ func (p *K8sPlacementProvider) GetNodeRuntime(ctx context.Context, namespaces []
 			Services:         map[string]struct{}{},
 			PodsByService:    map[string]int{},
 			ServiceResources: map[string][]PodResourceRequest{},
+			Taints:           taints,
 		}
 	}
 

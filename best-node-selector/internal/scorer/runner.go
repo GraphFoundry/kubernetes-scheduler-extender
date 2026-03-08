@@ -108,7 +108,8 @@ func runOnce(
 	)
 
 	// 4️⃣ Compute score for each service
-	// Use first namespace as default for now (could be enhanced to track per-namespace)
+	// Track bestNode selections within the cycle to prevent all services converging on one node
+	cycleState := &CycleState{NodeSelections: make(map[string]int)}
 	namespace := namespaces[0]
 	for service := range servicesSet {
 		select {
@@ -121,6 +122,7 @@ func runOnce(
 				service,
 				nodes,
 				windowSeconds,
+				cycleState,
 			)
 		}
 	}

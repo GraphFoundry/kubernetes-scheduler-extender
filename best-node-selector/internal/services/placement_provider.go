@@ -7,6 +7,11 @@ type PodResourceRequest struct {
 	MemBytes int64
 }
 
+type NodeTaint struct {
+	Key    string
+	Effect string // NoSchedule, NoExecute, PreferNoSchedule
+}
+
 type NodeRuntime struct {
 	Name             string
 	Ready            bool
@@ -18,6 +23,7 @@ type NodeRuntime struct {
 	Services         map[string]struct{}
 	PodsByService    map[string]int
 	ServiceResources map[string][]PodResourceRequest
+	Taints           []NodeTaint
 }
 
 // PlacementProvider tells "which services are running on which nodes" right now.

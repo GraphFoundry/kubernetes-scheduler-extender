@@ -254,7 +254,8 @@ func (c *Controller) isPodEligible(pod *v1.Pod) bool {
 			return false
 		}
 	}
-	if strings.Contains(strings.ToLower(pod.Spec.NodeName), "control-plane") || strings.Contains(strings.ToLower(pod.Spec.NodeName), "master") {
+	// Only skip pods on control-plane nodes if the node has NoSchedule/NoExecute taints
+	if c.isNodeTainted(pod.Spec.NodeName) {
 		return false
 	}
 	for _, cs := range pod.Status.ContainerStatuses {
@@ -263,6 +264,20 @@ func (c *Controller) isPodEligible(pod *v1.Pod) bool {
 		}
 	}
 	return len(pod.OwnerReferences) > 0
+}
+
+// isNodeTainted checks if a node has NoSchedule or NoExecute taints
+func (c *Controller) isNodeTainted(nodeName string) bool {
+	node, err := c.clientset.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
+	if err != nil {
+		return false
+	}
+	for _, taint := range node.Spec.Taints {
+		if taint.Effect == v1.TaintEffectNoSchedule || taint.Effect == v1.TaintEffectNoExecute {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Controller) pdbAllowsDisruption(ctx context.Context, pod *v1.Pod) bool {
