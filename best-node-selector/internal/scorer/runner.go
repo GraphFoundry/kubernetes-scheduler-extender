@@ -64,9 +64,24 @@ func runOnce(
 		return
 	}
 
-	// 2️⃣ Collect unique nodes
-	nodes := make([]string, 0, len(nodeServiceIndex))
+	// 2️⃣ Collect ALL cluster nodes (not just nodes with pods)
+	allNodeLabels, err := placement.GetNodeLabels(ctx)
+	if err != nil {
+		log.Printf("[SCORER][WARN] failed to get all node labels: %v, falling back to index nodes", err)
+	}
+
+	nodeSet := make(map[string]struct{})
+	// Include nodes from service index
 	for node := range nodeServiceIndex {
+		nodeSet[node] = struct{}{}
+	}
+	// Include ALL cluster nodes so empty nodes are also scored
+	for node := range allNodeLabels {
+		nodeSet[node] = struct{}{}
+	}
+
+	nodes := make([]string, 0, len(nodeSet))
+	for node := range nodeSet {
 		nodes = append(nodes, node)
 	}
 
@@ -84,14 +99,17 @@ func runOnce(
 	}
 
 	log.Printf(
-		"[SCORER] discovered services=%d nodes=%d namespaces=%v",
+		"[SCORER] discovered services=%d nodes=%d (index=%d, cluster=%d) namespaces=%v",
 		len(servicesSet),
 		len(nodes),
+		len(nodeServiceIndex),
+		len(allNodeLabels),
 		namespaces,
 	)
 
 	// 4️⃣ Compute score for each service
-	// Use first namespace as default for now (could be enhanced to track per-namespace)
+	// Track bestNode selections within the cycle to prevent all services converging on one node
+	cycleState := &CycleState{NodeSelections: make(map[string]int)}
 	namespace := namespaces[0]
 	for service := range servicesSet {
 		select {
@@ -104,6 +122,7 @@ func runOnce(
 				service,
 				nodes,
 				windowSeconds,
+				cycleState,
 			)
 		}
 	}

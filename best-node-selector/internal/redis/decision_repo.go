@@ -31,11 +31,20 @@ func decisionKey(namespace, service string) string {
 	return fmt.Sprintf("scheduler:decision:%s:%s", namespace, service)
 }
 
-// Save implements app.DecisionReader / scorer.DecisionWriter
+// Save persists a decision, preserving any user-set preferredNode from the
+// existing decision if the new decision does not carry one.
 func (r *DecisionRepository) Save(
 	ctx context.Context,
 	d *models.Decision,
 ) error {
+
+	// Preserve existing preferredNode when scorer overwrites the decision
+	if d.PreferredNode == "" {
+		existing, err := r.Get(ctx, d.Namespace, d.Service)
+		if err == nil && existing.PreferredNode != "" {
+			d.PreferredNode = existing.PreferredNode
+		}
+	}
 
 	data, err := json.Marshal(d)
 	if err != nil {

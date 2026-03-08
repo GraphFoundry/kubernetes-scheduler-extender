@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"best-node-selector/internal/config"
+	"best-node-selector/internal/rebalancer"
 	"best-node-selector/internal/redis"
 	"best-node-selector/internal/scheduler"
 	"best-node-selector/internal/scorer"
@@ -59,7 +60,9 @@ func main() {
 	}
 
 	// ✅ Initialize scorer with decision repository
-	scorerInstance := scorer.New(metricsProvider, placementProvider, decisionRepo)
+	scorerInstance := scorer.New(metricsProvider, placementProvider, decisionRepo, cfg.TopKPeers)
+	scorerInstance.SetPreferenceReader(repo) // ✅ Enable user preference lookups during scoring
+	rebalancerController := rebalancer.New(cfg, repo, metricsProvider, clientset)
 
 	log.Println("🚀 Production-grade scheduler initialized")
 	log.Printf("   Redis: %s", cfg.RedisAddr)
@@ -78,15 +81,31 @@ func main() {
 		log.Println("⏸️  Score updates disabled (ENABLE_SCORE_UPDATE=false)")
 	}
 
+	if cfg.RebalancingEnabled {
+		log.Println("✅ Starting controlled rebalancing loop")
+		go rebalancerController.Run(ctx)
+	} else {
+		log.Println("⏸️  Rebalancing disabled (REBALANCING_ENABLED=false)")
+	}
+
 	// 🌐 HTTP API
 	api := httptransport.NewAPI(decisionRepo, sched, cfg.TopKPeers, cfg.TargetServiceID)
 	api.SetClientset(clientset) // ✅ Enable pod restart functionality
+	api.SetMetricsHandler(rebalancerController.MetricsText)
+	api.SetRoundRobinCounter(repo) // ✅ Enable round-robin pod distribution
+	api.SetPreferenceStore(repo)   // ✅ Enable user node preferences
+	api.SetOverrideStore(repo)     // ✅ Enable change-node overrides
 	handlers := httptransport.Handlers{
 		Health:         api.Health,
+		Metrics:        api.Metrics,
 		Prioritize:     api.Prioritize,
 		List:           api.ListDecisions,
 		RestartPod:     api.RestartPod,
 		GetOptimalNode: api.GetOptimalNode,
+		ChangeNode:     api.ChangeNode,
+		SetPreference:  api.SetPreference,
+		DelPreference:  api.DeletePreference,
+		GetPreference:  api.GetPreference,
 	}
 	mux := httptransport.NewRouter(handlers)
 

@@ -12,6 +12,7 @@ type Decision struct {
 	Status        string         `json:"status"`
 	CurrentNodes  []string       `json:"currentNodes"`
 	BestNode      string         `json:"bestNode"`
+	PreferredNode string         `json:"preferredNode,omitempty"`
 	Scores        map[string]int `json:"scores"`
 	EvaluatedAt   time.Time      `json:"evaluatedAt"`
 	WindowSeconds int            `json:"windowSeconds"`
