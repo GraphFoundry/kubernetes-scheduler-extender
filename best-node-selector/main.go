@@ -95,6 +95,7 @@ func main() {
 	api.SetRoundRobinCounter(repo) // ✅ Enable round-robin pod distribution
 	api.SetPreferenceStore(repo)   // ✅ Enable user node preferences
 	api.SetOverrideStore(repo)     // ✅ Enable change-node overrides
+	api.SetChangeNodeLocker(repo)  // ✅ Enable distributed locking for change-node
 	handlers := httptransport.Handlers{
 		Health:         api.Health,
 		Metrics:        api.Metrics,

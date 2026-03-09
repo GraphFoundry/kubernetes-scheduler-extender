@@ -3,9 +3,11 @@ package httptransport
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"best-node-selector/internal/models"
@@ -39,6 +41,12 @@ type OverrideStore interface {
 	ConsumeNodeOverride(ctx context.Context, namespace, service string) (string, bool)
 }
 
+// ChangeNodeLocker provides distributed locking for change-node operations
+type ChangeNodeLocker interface {
+	AcquireChangeNodeLock(ctx context.Context, namespace, service string) (string, error)
+	ReleaseChangeNodeLock(ctx context.Context, namespace, service, lockUUID string) error
+}
+
 type API struct {
 	repo          DecisionReader
 	scheduler     *scheduler.Scheduler
@@ -46,6 +54,7 @@ type API struct {
 	rrCounter     RoundRobinCounter
 	prefStore     PreferenceStore
 	overrideStore OverrideStore
+	changeLocker  ChangeNodeLocker
 	metricsTextFn func() string
 	topK          int
 	targetService string
@@ -83,6 +92,11 @@ func (a *API) SetPreferenceStore(ps PreferenceStore) {
 // SetOverrideStore sets the override store for change-node operations
 func (a *API) SetOverrideStore(os OverrideStore) {
 	a.overrideStore = os
+}
+
+// SetChangeNodeLocker sets the distributed locker for change-node operations
+func (a *API) SetChangeNodeLocker(locker ChangeNodeLocker) {
+	a.changeLocker = locker
 }
 
 func (a *API) Health(w http.ResponseWriter, r *http.Request) {
@@ -134,7 +148,9 @@ func (a *API) Prioritize(w http.ResponseWriter, r *http.Request) {
 	}
 
 	service := ""
-	if v, ok := args.Pod.Labels["extender.kubernetes.io/name"]; ok {
+	if v, ok := args.Pod.Labels["app"]; ok {
+		service = v
+	} else if v, ok := args.Pod.Labels["app.kubernetes.io/name"]; ok {
 		service = v
 	}
 
@@ -414,9 +430,9 @@ func (a *API) RestartPod(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, response)
 }
 
-// ChangeNode handles requests to move a pod to a different node.
-// It deletes the pod so the controller recreates it, and the round-robin/scoring
-// will place it on the target node.
+// ChangeNode handles requests to move a pod to a different node gracefully.
+// It scales up the deployment, waits for a new pod on the target node,
+// then removes the old pod — avoiding downtime.
 // POST /change-node
 func (a *API) ChangeNode(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -468,7 +484,7 @@ func (a *API) ChangeNode(w http.ResponseWriter, r *http.Request) {
 	currentNode := pod.Spec.NodeName
 
 	// 2. Verify target node exists and is ready
-	targetNode, err := a.clientset.CoreV1().Nodes().Get(ctx, req.TargetNode, metav1.GetOptions{})
+	targetNodeObj, err := a.clientset.CoreV1().Nodes().Get(ctx, req.TargetNode, metav1.GetOptions{})
 	if err != nil {
 		log.Printf("[HTTP][CHANGE-NODE] target node not found: %v", err)
 		http.Error(w, "target node not found", http.StatusBadRequest)
@@ -476,7 +492,7 @@ func (a *API) ChangeNode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	nodeReady := false
-	for _, cond := range targetNode.Status.Conditions {
+	for _, cond := range targetNodeObj.Status.Conditions {
 		if cond.Type == "Ready" && cond.Status == "True" {
 			nodeReady = true
 			break
@@ -497,13 +513,64 @@ func (a *API) ChangeNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 4. Extract service name from pod labels so we can store the override
+	// 4. Extract service name from pod labels
 	serviceName := serviceNameFromPodLabels(pod.Labels)
 	if serviceName == "" {
 		log.Printf("[HTTP][CHANGE-NODE] WARNING: could not extract service name from pod labels, override may not work")
 	}
 
-	// 5. Store the node override in Redis BEFORE deleting the pod
+	// 5. Find the deployment that owns this pod (via ReplicaSet → Deployment)
+	deploymentName := ""
+	for _, owner := range pod.OwnerReferences {
+		if owner.Kind == "ReplicaSet" && owner.Name != "" {
+			// Look up the ReplicaSet to find its owning Deployment
+			rs, rsErr := a.clientset.AppsV1().ReplicaSets(req.Namespace).Get(ctx, owner.Name, metav1.GetOptions{})
+			if rsErr == nil {
+				for _, rsOwner := range rs.OwnerReferences {
+					if rsOwner.Kind == "Deployment" {
+						deploymentName = rsOwner.Name
+						break
+					}
+				}
+			}
+			if deploymentName == "" {
+				// Fallback: strip hash suffix from ReplicaSet name
+				parts := strings.Split(owner.Name, "-")
+				if len(parts) > 1 {
+					deploymentName = strings.Join(parts[:len(parts)-1], "-")
+				}
+			}
+			break
+		}
+	}
+
+	if deploymentName == "" {
+		log.Printf("[HTTP][CHANGE-NODE] could not determine deployment for pod=%s, falling back to destructive change", req.PodName)
+		a.changeNodeDestructive(w, r, req.Namespace, req.PodName, req.TargetNode, currentNode, serviceName)
+		return
+	}
+
+	// 6. Acquire Redis lock to prevent concurrent change-node operations
+	var lockUUID string
+	if a.changeLocker != nil && serviceName != "" {
+		var lockErr error
+		lockUUID, lockErr = a.changeLocker.AcquireChangeNodeLock(ctx, req.Namespace, serviceName)
+		if lockErr != nil {
+			log.Printf("[HTTP][CHANGE-NODE] failed to acquire lock: %v", lockErr)
+			http.Error(w, fmt.Sprintf("change-node operation already in progress: %v", lockErr), http.StatusConflict)
+			return
+		}
+		log.Printf("[HTTP][CHANGE-NODE] acquired lock for %s/%s (uuid=%s)", req.Namespace, serviceName, lockUUID)
+		defer func() {
+			if releaseErr := a.changeLocker.ReleaseChangeNodeLock(ctx, req.Namespace, serviceName, lockUUID); releaseErr != nil {
+				log.Printf("[HTTP][CHANGE-NODE] WARNING: failed to release lock: %v", releaseErr)
+			} else {
+				log.Printf("[HTTP][CHANGE-NODE] released lock for %s/%s", req.Namespace, serviceName)
+			}
+		}()
+	}
+
+	// 7. Store the node override in Redis BEFORE scaling up
 	if a.overrideStore != nil && serviceName != "" {
 		if err := a.overrideStore.SetNodeOverride(ctx, req.Namespace, serviceName, req.TargetNode); err != nil {
 			log.Printf("[HTTP][CHANGE-NODE] WARNING: failed to store override: %v", err)
@@ -513,20 +580,116 @@ func (a *API) ChangeNode(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 6. Delete the pod so the controller recreates it
-	log.Printf("[HTTP][CHANGE-NODE] deleting pod=%s/%s (currentNode=%s) to reschedule to targetNode=%s",
-		req.Namespace, req.PodName, currentNode, req.TargetNode)
+	// 8. Scale up the deployment by 1 replica
+	deployment, err := a.clientset.AppsV1().Deployments(req.Namespace).Get(ctx, deploymentName, metav1.GetOptions{})
+	if err != nil {
+		log.Printf("[HTTP][CHANGE-NODE] failed to get deployment %s: %v", deploymentName, err)
+		http.Error(w, "failed to get deployment", http.StatusInternalServerError)
+		return
+	}
+
+	originalReplicas := int32(1)
+	if deployment.Spec.Replicas != nil {
+		originalReplicas = *deployment.Spec.Replicas
+	}
+	scaledReplicas := originalReplicas + 1
+
+	log.Printf("[HTTP][CHANGE-NODE] scaling deployment=%s from %d to %d replicas",
+		deploymentName, originalReplicas, scaledReplicas)
+
+	scale, err := a.clientset.AppsV1().Deployments(req.Namespace).GetScale(ctx, deploymentName, metav1.GetOptions{})
+	if err != nil {
+		log.Printf("[HTTP][CHANGE-NODE] failed to get scale: %v", err)
+		http.Error(w, "failed to scale deployment", http.StatusInternalServerError)
+		return
+	}
+	scale.Spec.Replicas = scaledReplicas
+	_, err = a.clientset.AppsV1().Deployments(req.Namespace).UpdateScale(ctx, deploymentName, scale, metav1.UpdateOptions{})
+	if err != nil {
+		log.Printf("[HTTP][CHANGE-NODE] failed to scale up: %v", err)
+		http.Error(w, "failed to scale up deployment", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[HTTP][CHANGE-NODE] deployment scaled up, waiting for new pod on targetNode=%s", req.TargetNode)
+
+	// 9. Wait for a new pod on the target node to be Running+Ready (poll with timeout)
+	const pollInterval = 2 * time.Second
+	const pollTimeout = 90 * time.Second
+	deadline := time.Now().Add(pollTimeout)
+	newPodReady := false
+
+	for time.Now().Before(deadline) {
+		time.Sleep(pollInterval)
+
+		pods, listErr := a.clientset.CoreV1().Pods(req.Namespace).List(ctx, metav1.ListOptions{})
+		if listErr != nil {
+			log.Printf("[HTTP][CHANGE-NODE] failed to list pods: %v", listErr)
+			continue
+		}
+
+		for _, p := range pods.Items {
+			// Skip the old pod
+			if p.Name == req.PodName {
+				continue
+			}
+			// Must be on the target node
+			if p.Spec.NodeName != req.TargetNode {
+				continue
+			}
+			// Must belong to the same deployment (check labels match)
+			if !labelsMatchService(p.Labels, serviceName) {
+				continue
+			}
+			// Must be Running and Ready
+			if p.Status.Phase != "Running" {
+				continue
+			}
+			ready := false
+			for _, cond := range p.Status.Conditions {
+				if cond.Type == "Ready" && cond.Status == "True" {
+					ready = true
+					break
+				}
+			}
+			if ready {
+				log.Printf("[HTTP][CHANGE-NODE] new pod %s is Running+Ready on targetNode=%s",
+					p.Name, req.TargetNode)
+				newPodReady = true
+				break
+			}
+		}
+
+		if newPodReady {
+			break
+		}
+		log.Printf("[HTTP][CHANGE-NODE] still waiting for new pod on targetNode=%s ...", req.TargetNode)
+	}
+
+	if !newPodReady {
+		// Timeout: scale back down and report failure
+		log.Printf("[HTTP][CHANGE-NODE] TIMEOUT waiting for new pod, scaling back down")
+		a.scaleDeployment(ctx, req.Namespace, deploymentName, originalReplicas)
+		http.Error(w, "timeout waiting for new pod to become ready on target node", http.StatusGatewayTimeout)
+		return
+	}
+
+	// 10. Delete the old pod now that the new one is healthy
+	log.Printf("[HTTP][CHANGE-NODE] deleting old pod=%s/%s (currentNode=%s)",
+		req.Namespace, req.PodName, currentNode)
 
 	deleteOptions := metav1.DeleteOptions{}
 	err = a.clientset.CoreV1().Pods(req.Namespace).Delete(ctx, req.PodName, deleteOptions)
 	if err != nil {
-		log.Printf("[HTTP][CHANGE-NODE] delete failed: %v", err)
-		http.Error(w, "failed to delete pod for rescheduling", http.StatusInternalServerError)
-		return
+		log.Printf("[HTTP][CHANGE-NODE] failed to delete old pod: %v", err)
+		// Continue anyway — the new pod is healthy, scale back down
 	}
 
-	log.Printf("[HTTP][CHANGE-NODE] pod deleted, will be rescheduled. namespace=%s pod=%s targetNode=%s",
-		req.Namespace, req.PodName, req.TargetNode)
+	// 11. Scale deployment back to original replicas
+	a.scaleDeployment(ctx, req.Namespace, deploymentName, originalReplicas)
+
+	log.Printf("[HTTP][CHANGE-NODE] graceful migration complete. namespace=%s pod=%s %s→%s",
+		req.Namespace, req.PodName, currentNode, req.TargetNode)
 
 	writeJSON(w, map[string]any{
 		"success":      true,
@@ -534,6 +697,60 @@ func (a *API) ChangeNode(w http.ResponseWriter, r *http.Request) {
 		"podName":      req.PodName,
 		"previousNode": currentNode,
 		"targetNode":   req.TargetNode,
+		"message":      fmt.Sprintf("Pod gracefully migrated from %s to %s (zero-downtime)", currentNode, req.TargetNode),
+	})
+}
+
+// scaleDeployment sets the replica count for a deployment
+func (a *API) scaleDeployment(ctx context.Context, namespace, deploymentName string, replicas int32) {
+	scale, err := a.clientset.AppsV1().Deployments(namespace).GetScale(ctx, deploymentName, metav1.GetOptions{})
+	if err != nil {
+		log.Printf("[HTTP][CHANGE-NODE] failed to get scale for rollback: %v", err)
+		return
+	}
+	scale.Spec.Replicas = replicas
+	_, err = a.clientset.AppsV1().Deployments(namespace).UpdateScale(ctx, deploymentName, scale, metav1.UpdateOptions{})
+	if err != nil {
+		log.Printf("[HTTP][CHANGE-NODE] failed to scale to %d: %v", replicas, err)
+	} else {
+		log.Printf("[HTTP][CHANGE-NODE] scaled deployment=%s to %d replicas", deploymentName, replicas)
+	}
+}
+
+// labelsMatchService checks if a pod's labels indicate it belongs to the given service
+func labelsMatchService(labels map[string]string, service string) bool {
+	if service == "" {
+		return false
+	}
+	svcFromLabels := serviceNameFromPodLabels(labels)
+	return svcFromLabels == service
+}
+
+// changeNodeDestructive is the fallback when the deployment cannot be determined.
+// It uses the old destructive approach: store override + delete pod.
+func (a *API) changeNodeDestructive(w http.ResponseWriter, r *http.Request, namespace, podName, targetNode, currentNode, serviceName string) {
+	ctx := r.Context()
+
+	if a.overrideStore != nil && serviceName != "" {
+		if err := a.overrideStore.SetNodeOverride(ctx, namespace, serviceName, targetNode); err != nil {
+			log.Printf("[HTTP][CHANGE-NODE] WARNING: failed to store override: %v", err)
+		}
+	}
+
+	deleteOptions := metav1.DeleteOptions{}
+	err := a.clientset.CoreV1().Pods(namespace).Delete(ctx, podName, deleteOptions)
+	if err != nil {
+		log.Printf("[HTTP][CHANGE-NODE] delete failed: %v", err)
+		http.Error(w, "failed to delete pod for rescheduling", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, map[string]any{
+		"success":      true,
+		"namespace":    namespace,
+		"podName":      podName,
+		"previousNode": currentNode,
+		"targetNode":   targetNode,
 		"message":      "Pod deleted - controller will recreate and scheduler will place on target node",
 	})
 }
@@ -778,19 +995,13 @@ func writeJSON(w http.ResponseWriter, v any) {
 
 // serviceNameFromPodLabels extracts the service name from pod labels
 func serviceNameFromPodLabels(labels map[string]string) string {
-	if v := labels["extender.kubernetes.io/name"]; v != "" {
+	if v := labels["app"]; v != "" {
 		return v
 	}
-	if v := labels["extender"]; v != "" {
-		return v
-	}
-	if v := labels["k8s-extender"]; v != "" {
+	if v := labels["app.kubernetes.io/name"]; v != "" {
 		return v
 	}
 	if v := labels["service.istio.io/canonical-name"]; v != "" {
-		return v
-	}
-	if v := labels["app"]; v != "" {
 		return v
 	}
 	return ""

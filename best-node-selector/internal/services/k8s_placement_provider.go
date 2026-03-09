@@ -243,22 +243,16 @@ func podResourceRequest(pod *v1.Pod) (int64, int64) {
 }
 
 func serviceNameFromLabels(labels map[string]string) string {
-	// Try common Kubernetes conventions
-	if v := labels["extender.kubernetes.io/name"]; v != "" {
+	// Try standard app label
+	if v := labels["app"]; v != "" {
 		return v
 	}
-	if v := labels["extender"]; v != "" {
-		return v
-	}
-	if v := labels["k8s-extender"]; v != "" {
+	// Try app.kubernetes.io/name
+	if v := labels["app.kubernetes.io/name"]; v != "" {
 		return v
 	}
 	// Try Istio canonical name
 	if v := labels["service.istio.io/canonical-name"]; v != "" {
-		return v
-	}
-	// Try standard app label
-	if v := labels["app"]; v != "" {
 		return v
 	}
 	return ""
