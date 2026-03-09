@@ -32,6 +32,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	config.Init(cfg)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
