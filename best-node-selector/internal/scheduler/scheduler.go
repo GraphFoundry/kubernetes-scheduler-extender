@@ -732,10 +732,6 @@ func (s *Scheduler) UpdateNodeStateFromAPI(ctx context.Context, node *v1.Node) e
 
 // extractServiceName extracts service identifier from pod labels
 func extractServiceName(pod *v1.Pod) string {
-	// Try extender-specific label first
-	if service, ok := pod.Labels["extender.kubernetes.io/name"]; ok && service != "" {
-		return service
-	}
 	// Try standard app label
 	if app, ok := pod.Labels["app"]; ok && app != "" {
 		return app

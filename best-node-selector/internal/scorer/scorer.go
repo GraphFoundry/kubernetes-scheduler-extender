@@ -27,6 +27,7 @@ const (
 	riskCriticalitySlope   = 0.2
 	concentrationWeight    = 0.25
 	nodeDensityWeight      = 0.15
+	minScoreFloor          = 15 // minimum score for any feasible node
 )
 
 // CycleState tracks bestNode selections within a single scoring cycle
@@ -264,13 +265,23 @@ func (s *Scorer) ComputeForService(
 				riskWeight*riskPenalty
 	}
 
-	normalized := normalizeMapValues(rawScores, feasibleNodes)
-	scores := make(map[string]int, len(nodes))
-	for _, node := range nodes {
-		scores[node] = 0
+	// Absolute scaling: map raw scores to [minScoreFloor, 100] using the
+	// theoretical maximum of the weighted formula so every feasible node
+	// gets a meaningful, non-zero score instead of relative 0-or-100.
+	theoreticalMax := localityWeight + utilWeight + spreadWeight + nodeDensityWeight + concentrationWeight
+	if theoreticalMax <= 0 {
+		theoreticalMax = 1.0
 	}
+	scores := make(map[string]int, len(feasibleNodes))
 	for _, node := range feasibleNodes {
-		scores[node] = int(math.Round(normalized[node] * 100))
+		pct := rawScores[node] / theoreticalMax
+		if pct < 0 {
+			pct = 0
+		}
+		if pct > 1 {
+			pct = 1
+		}
+		scores[node] = int(math.Round(float64(minScoreFloor) + (100-float64(minScoreFloor))*pct))
 	}
 
 	// 7. Find best node (deterministic tie-break, only from feasible nodes)
@@ -518,11 +529,12 @@ func medianInt64(vals []int64) int64 {
 }
 
 // filterSchedulableNodes returns nodes eligible for scheduling.
-// Control-plane nodes are included if they have no NoSchedule/NoExecute taints.
+// Any node with NoSchedule or NoExecute taints is excluded.
 func filterSchedulableNodes(nodes []string, nodeLabels map[string]map[string]string, nodeRuntime map[string]services.NodeRuntime) []string {
 	var schedulable []string
 	for _, node := range nodes {
-		if isControlPlaneNode(node, nodeLabels) && hasBlockingTaints(node, nodeRuntime) {
+		if hasBlockingTaints(node, nodeRuntime) {
+			log.Printf("[SCORER] excluding node=%s (NoSchedule/NoExecute taint)", node)
 			continue
 		}
 		schedulable = append(schedulable, node)
@@ -618,8 +630,8 @@ func (s *Scorer) writeNeutralDecision(
 	}
 
 	scores := make(map[string]int)
-	// Worker nodes get score 50, control-plane nodes get 30 (lower preference but still viable)
-	for _, node := range nodes {
+	// Only include schedulable nodes (exclude NoSchedule tainted)
+	for _, node := range targetNodes {
 		if isWorkerNode(node, nodeLabels) {
 			scores[node] = 50
 		} else {

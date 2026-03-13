@@ -17,6 +17,8 @@ const (
 	lockTTL              = 500 * time.Millisecond
 	nodeLockKeyPrefix    = "lock:node:"
 	podLockKeyPrefix     = "lock:pod:"
+	changeNodeLockPrefix = "lock:change-node:"
+	changeNodeLockTTL    = 2 * time.Minute
 	nodeKeyPrefix        = "node:"
 	podIntentPrefix      = "pod:"
 	roundRobinKeyPrefix  = "rr:"
@@ -440,4 +442,35 @@ func (r *SchedulerRepository) ConsumeNodeOverride(ctx context.Context, namespace
 		return "", false
 	}
 	return node, true
+}
+
+// AcquireChangeNodeLock acquires a distributed lock for a change-node operation on a service.
+// Returns a lock UUID that must be passed to ReleaseChangeNodeLock.
+func (r *SchedulerRepository) AcquireChangeNodeLock(ctx context.Context, namespace, service string) (string, error) {
+	lockKey := changeNodeLockPrefix + namespace + ":" + service
+	lockUUID := uuid.New().String()
+
+	ok, err := r.rdb.SetNX(ctx, lockKey, lockUUID, changeNodeLockTTL).Result()
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", fmt.Errorf("change-node operation already in progress for %s/%s", namespace, service)
+	}
+	return lockUUID, nil
+}
+
+// ReleaseChangeNodeLock releases a distributed lock for a change-node operation.
+// Only deletes if the UUID matches (prevents releasing someone else's lock).
+func (r *SchedulerRepository) ReleaseChangeNodeLock(ctx context.Context, namespace, service, lockUUID string) error {
+	lockKey := changeNodeLockPrefix + namespace + ":" + service
+
+	script := `
+		if redis.call("GET", KEYS[1]) == ARGV[1] then
+			return redis.call("DEL", KEYS[1])
+		else
+			return 0
+		end
+	`
+	return r.rdb.Eval(ctx, script, []string{lockKey}, lockUUID).Err()
 }

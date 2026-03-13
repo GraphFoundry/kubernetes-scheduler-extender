@@ -1,6 +1,12 @@
 package httptransport
 
-import "net/http"
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+
+	"best-node-selector/internal/config"
+)
 
 type Handlers struct {
 	Health         http.HandlerFunc
@@ -61,6 +67,23 @@ func NewRouter(h Handlers) http.Handler {
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
+	})
+
+	// Runtime config reload endpoint
+	mux.HandleFunc("POST /admin/reload-config", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Env map[string]string `json:"env"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := config.ReloadWithOverrides("/etc/runtime-config/runtime.env", body.Env); err != nil {
+			log.Printf("[CONFIG] Reload failed: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"status":"error","message":"` + err.Error() + `"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"reloaded"}`))
 	})
 
 	return corsMiddleware(mux)
